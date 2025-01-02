@@ -3,35 +3,42 @@ import AVKit
 
 struct MoreVideosView: View {
     @ObservedObject var videoPlayerModel: VideoPlayerModel
-    @State private var selectedVideos: Set<UUID> = []
-    @State private var downloadingVideos: Set<UUID> = []
+    @State private var selectedVideoIds: Set<String> = []
+    @State private var downloadingVideoIds: Set<String> = []
     @FocusState private var focusedVideoId: UUID?
     
     var allVideos: [VideoPlayerModel.VideoItem] {
-        // Local videos first, followed by remote videos
-        videoPlayerModel.videos.filter { $0.isLocal } + videoPlayerModel.remoteVideos
+        // Local videos first, followed by remote videos, in fixed order
+        videoPlayerModel.videos + videoPlayerModel.remoteVideos
     }
     
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 20), count: 4), spacing: 20) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 40), count: 4), spacing: 40) {
                 ForEach(allVideos) { video in
                     VideoItemView(
                         video: video,
-                        isSelected: selectedVideos.contains(video.id),
-                        isDownloading: downloadingVideos.contains(video.id)
+                        isSelected: selectedVideoIds.contains(video.id.uuidString),
+                        isDownloading: downloadingVideoIds.contains(video.id.uuidString)
                     ) {
                         toggleVideo(video)
                     }
                     .focused($focusedVideoId, equals: video.id)
                 }
             }
-            .padding(40)
+            .padding(60)
         }
         .onAppear {
-            // Initialize selected videos with local videos
-            selectedVideos = Set(videoPlayerModel.videos.filter { $0.isLocal }.map { $0.id })
-            // Set initial focus to first video
+            // Load selected videos from UserDefaults
+            if let selectedIds = UserDefaults.standard.array(forKey: "selectedVideoIds") as? [String] {
+                selectedVideoIds = Set(selectedIds)
+            } else {
+                // First launch - select all local videos
+                selectedVideoIds = Set(videoPlayerModel.videos.map { $0.id.uuidString })
+                UserDefaults.standard.set(Array(selectedVideoIds), forKey: "selectedVideoIds")
+            }
+            
+            // Set initial focus
             if let firstVideo = allVideos.first {
                 focusedVideoId = firstVideo.id
             }
@@ -39,21 +46,35 @@ struct MoreVideosView: View {
     }
     
     private func toggleVideo(_ video: VideoPlayerModel.VideoItem) {
-        if selectedVideos.contains(video.id) {
-            selectedVideos.remove(video.id)
-            videoPlayerModel.removeVideo(video)
+        if selectedVideoIds.contains(video.id.uuidString) {
+            // Prevent toggling off if this is the last selected local video
+            let selectedLocalVideos = allVideos.filter { 
+                $0.isLocal && selectedVideoIds.contains($0.id.uuidString)
+            }
+            if selectedLocalVideos.count <= 1 && video.isLocal {
+                return // Don't allow toggling off the last video
+            }
+            
+            selectedVideoIds.remove(video.id.uuidString)
         } else {
-            selectedVideos.insert(video.id)
-            if !video.isLocal {
-                downloadingVideos.insert(video.id)
-                // Start downloading/streaming
-                videoPlayerModel.downloadAndAddVideo(video) { success in
-                    downloadingVideos.remove(video.id)
-                }
+            if video.isLocal {
+                selectedVideoIds.insert(video.id.uuidString)
             } else {
-                videoPlayerModel.addVideo(video)
+                downloadingVideoIds.insert(video.id.uuidString)
+                videoPlayerModel.downloadAndAddVideo(video) { success in
+                    downloadingVideoIds.remove(video.id.uuidString)
+                    if success {
+                        selectedVideoIds.insert(video.id.uuidString)
+                    }
+                }
             }
         }
+        
+        // Update the video player with only local selected videos
+        let selectedVideos = allVideos.filter { video in
+            video.isLocal && selectedVideoIds.contains(video.id.uuidString)
+        }
+        videoPlayerModel.updateSelectedVideos(selectedVideos)
     }
 }
 
@@ -65,7 +86,7 @@ struct VideoItemView: View {
     
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 12) {
+            VStack(spacing: 16) {
                 // Thumbnail
                 AsyncImage(url: video.thumbnailURL) { image in
                     image
@@ -78,16 +99,17 @@ struct VideoItemView: View {
                 .aspectRatio(16/9, contentMode: .fit)
                 .cornerRadius(8)
                 
+                // Title and Selection Status
                 HStack {
-                    // Title
                     Text(video.title)
-                        .font(.headline)
+                        .font(.title3)
+                        .fontWeight(.medium)
                         .foregroundColor(.white)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
                     
                     Spacer()
                     
-                    // Checkbox
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.title3)
                         .foregroundColor(isSelected ? .white : .gray)
@@ -98,7 +120,7 @@ struct VideoItemView: View {
                         .progressViewStyle(.linear)
                 }
             }
-            .padding()
+            .padding(20)
             .background(Color.black.opacity(0.3))
             .cornerRadius(12)
         }
