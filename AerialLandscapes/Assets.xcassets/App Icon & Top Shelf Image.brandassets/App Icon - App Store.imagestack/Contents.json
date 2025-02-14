@@ -9,12 +9,9 @@
     },
     {
       "filename" : "Back.imagestacklayer"
+    },
+    {
+      "filename" : "Front.imagestacklayer"
     }
-  ],
-  "properties" : {
-    "canvasSize" : {
-      "height" : 768,
-      "width" : 1280
-    }
-  }
+  ]
 }

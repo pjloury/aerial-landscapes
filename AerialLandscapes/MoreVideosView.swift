@@ -5,7 +5,7 @@ struct MoreVideosView: View {
     @ObservedObject var videoPlayerModel: VideoPlayerModel
     @State private var selectedVideoIds: Set<String> = []
     @State private var downloadingVideoIds: Set<String> = []
-    @FocusState private var focusedVideoId: UUID?
+    @FocusState private var focusedVideoId: String?
     
     var allVideos: [VideoPlayerModel.VideoItem] {
         // Local videos first, followed by remote videos, in fixed order
@@ -18,8 +18,8 @@ struct MoreVideosView: View {
                 ForEach(allVideos) { video in
                     VideoItemView(
                         video: video,
-                        isSelected: selectedVideoIds.contains(video.id.uuidString),
-                        isDownloading: downloadingVideoIds.contains(video.id.uuidString)
+                        isSelected: selectedVideoIds.contains(video.id),
+                        isDownloading: downloadingVideoIds.contains(video.id)
                     ) {
                         toggleVideo(video)
                     }
@@ -34,7 +34,7 @@ struct MoreVideosView: View {
                 selectedVideoIds = Set(selectedIds)
             } else {
                 // First launch - select all local videos
-                selectedVideoIds = Set(videoPlayerModel.videos.map { $0.id.uuidString })
+                selectedVideoIds = Set(videoPlayerModel.videos.map { $0.id })
                 UserDefaults.standard.set(Array(selectedVideoIds), forKey: "selectedVideoIds")
             }
             
@@ -46,25 +46,25 @@ struct MoreVideosView: View {
     }
     
     private func toggleVideo(_ video: VideoPlayerModel.VideoItem) {
-        if selectedVideoIds.contains(video.id.uuidString) {
+        if selectedVideoIds.contains(video.id) {
             // Prevent toggling off if this is the last selected local video
             let selectedLocalVideos = allVideos.filter { 
-                $0.isLocal && selectedVideoIds.contains($0.id.uuidString)
+                $0.isLocal && selectedVideoIds.contains($0.id)
             }
             if selectedLocalVideos.count <= 1 && video.isLocal {
                 return // Don't allow toggling off the last video
             }
             
-            selectedVideoIds.remove(video.id.uuidString)
+            selectedVideoIds.remove(video.id)
         } else {
             if video.isLocal {
-                selectedVideoIds.insert(video.id.uuidString)
+                selectedVideoIds.insert(video.id)
             } else {
-                downloadingVideoIds.insert(video.id.uuidString)
+                downloadingVideoIds.insert(video.id)
                 videoPlayerModel.downloadAndAddVideo(video) { success in
-                    downloadingVideoIds.remove(video.id.uuidString)
+                    downloadingVideoIds.remove(video.id)
                     if success {
-                        selectedVideoIds.insert(video.id.uuidString)
+                        selectedVideoIds.insert(video.id)
                     }
                 }
             }
@@ -72,7 +72,7 @@ struct MoreVideosView: View {
         
         // Update the video player with only local selected videos
         let selectedVideos = allVideos.filter { video in
-            video.isLocal && selectedVideoIds.contains(video.id.uuidString)
+            video.isLocal && selectedVideoIds.contains(video.id)
         }
         videoPlayerModel.updateSelectedVideos(selectedVideos)
     }
@@ -86,7 +86,7 @@ struct VideoItemView: View {
     
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 16) {
+            VStack(spacing: 12) {
                 // Thumbnail
                 AsyncImage(url: video.thumbnailURL) { image in
                     image
@@ -100,27 +100,28 @@ struct VideoItemView: View {
                 .cornerRadius(8)
                 
                 // Title and Selection Status
-                HStack {
+                HStack(alignment: .center) {
                     Text(video.title)
-                        .font(.title3)
-                        .fontWeight(.medium)
+                        .font(.system(size: 22, weight: .medium))
                         .foregroundColor(.white)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
                     
                     Spacer()
                     
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.title3)
+                        .font(.system(size: 24))
                         .foregroundColor(isSelected ? .white : .gray)
                 }
+                .frame(height: 60)
                 
                 if isDownloading {
                     ProgressView()
                         .progressViewStyle(.linear)
                 }
             }
-            .padding(20)
+            .padding(16)
             .background(Color.black.opacity(0.3))
             .cornerRadius(12)
         }
