@@ -8,8 +8,27 @@ struct MoreVideosView: View {
     @FocusState private var focusedVideoId: String?
     
     var allVideos: [VideoPlayerModel.VideoItem] {
-        // Local videos first, followed by remote videos, in fixed order
-        videoPlayerModel.videos + videoPlayerModel.remoteVideos
+        // Get the list of downloaded video titles
+        let downloadedTitles = Set(videoPlayerModel.videos.map { $0.title })
+        
+        // Create a dictionary of local videos by title for quick lookup
+        let localVideosByTitle = Dictionary(uniqueKeysWithValues: 
+            videoPlayerModel.videos.map { ($0.title, $0) }
+        )
+        
+        // Combine bundled and remote videos in their original order
+        let orderedVideos = videoPlayerModel.videos.filter { video in
+            // Keep only bundled videos that aren't in remote list
+            !videoPlayerModel.remoteVideos.contains { $0.title == video.title }
+        } + videoPlayerModel.remoteVideos.map { remoteVideo in
+            // For each remote video, use local version if downloaded, otherwise use remote
+            if let localVideo = localVideosByTitle[remoteVideo.title] {
+                return localVideo
+            }
+            return remoteVideo
+        }
+        
+        return orderedVideos
     }
     
     var body: some View {
@@ -17,6 +36,7 @@ struct MoreVideosView: View {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 40), count: 4), spacing: 40) {
                 ForEach(allVideos) { video in
                     VideoItemView(
+                        videoPlayerModel: videoPlayerModel,
                         video: video,
                         isSelected: selectedVideoIds.contains(video.id),
                         isDownloading: downloadingVideoIds.contains(video.id)
@@ -60,11 +80,31 @@ struct MoreVideosView: View {
             if video.isLocal {
                 selectedVideoIds.insert(video.id)
             } else {
-                downloadingVideoIds.insert(video.id)
-                videoPlayerModel.downloadAndAddVideo(video) { success in
-                    downloadingVideoIds.remove(video.id)
-                    if success {
-                        selectedVideoIds.insert(video.id)
+                // Check if we already have a local version
+                if let localVersion = videoPlayerModel.videos.first(where: { $0.title == video.title }) {
+                    // Use the local version's ID
+                    selectedVideoIds.insert(localVersion.id)
+                    // Update the video player immediately
+                    let selectedVideos = allVideos.filter { video in
+                        video.isLocal && selectedVideoIds.contains(video.id)
+                    }
+                    videoPlayerModel.updateSelectedVideos(selectedVideos)
+                } else {
+                    // Start download for new video
+                    downloadingVideoIds.insert(video.id)
+                    videoPlayerModel.downloadAndAddVideo(video) { success in
+                        downloadingVideoIds.remove(video.id)
+                        if success {
+                            // Find the newly added local version
+                            if let localVersion = videoPlayerModel.videos.first(where: { $0.title == video.title }) {
+                                selectedVideoIds.insert(localVersion.id)
+                                // Update the video player
+                                let selectedVideos = allVideos.filter { video in
+                                    video.isLocal && selectedVideoIds.contains(video.id)
+                                }
+                                videoPlayerModel.updateSelectedVideos(selectedVideos)
+                            }
+                        }
                     }
                 }
             }
@@ -79,6 +119,7 @@ struct MoreVideosView: View {
 }
 
 struct VideoItemView: View {
+    @ObservedObject var videoPlayerModel: VideoPlayerModel
     let video: VideoPlayerModel.VideoItem
     let isSelected: Bool
     let isDownloading: Bool
@@ -117,8 +158,9 @@ struct VideoItemView: View {
                 .frame(height: 60)
                 
                 if isDownloading {
-                    ProgressView()
+                    ProgressView(value: videoPlayerModel.downloadProgress[video.id] ?? 0)
                         .progressViewStyle(.linear)
+                        .tint(.accentColor)
                 }
             }
             .padding(16)

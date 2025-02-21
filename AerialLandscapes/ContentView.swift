@@ -43,18 +43,28 @@ struct NowPlayingView: View {
             VideoPlayerView(player: videoPlayerModel.player)
                 .edgesIgnoringSafeArea(.all)
             
-            // Title overlay (always visible)
-            VStack {
-                Spacer()
-                HStack {
-                    Text(videoPlayerModel.currentVideoTitle)
-                        .font(.system(.callout, design: .default))
-                        .foregroundColor(.white)
-                        .shadow(color: .black.opacity(0.8), radius: 6, x: 0, y: 2)
-                        .shadow(color: .black.opacity(0.6), radius: 4, x: 0, y: 1)
-                        .padding(.leading, 60)
-                        .padding(.bottom, 60)
+            // Show message when no videos are selected
+            if videoPlayerModel.currentPlaylist.isEmpty {
+                Text("Head to More Videos to get started")
+                    .font(.system(size: 30, weight: .medium))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.8), radius: 6, x: 0, y: 2)
+            }
+            
+            // Title overlay (only show when video is playing)
+            if !videoPlayerModel.currentPlaylist.isEmpty {
+                VStack {
                     Spacer()
+                    HStack {
+                        Text(videoPlayerModel.currentVideoTitle)
+                            .font(.system(.callout, design: .default))
+                            .foregroundColor(.white)
+                            .shadow(color: .black.opacity(0.8), radius: 6, x: 0, y: 2)
+                            .shadow(color: .black.opacity(0.6), radius: 4, x: 0, y: 1)
+                            .padding(.leading, 60)
+                            .padding(.bottom, 60)
+                        Spacer()
+                    }
                 }
             }
         }

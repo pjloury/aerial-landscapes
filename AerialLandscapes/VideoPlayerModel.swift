@@ -5,8 +5,27 @@ class VideoPlayerModel: NSObject, ObservableObject {
     @Published var currentVideoTitle: String = ""
     let player: AVQueuePlayer
     @Published var videos: [VideoItem] = []  // Local videos only
-    private var currentPlaylist: [VideoItem] = []
+    @Published private(set) var currentPlaylist: [VideoItem] = []
     private let selectedVideoIdsKey = "selectedVideoIds"
+    
+    // Add a property to track download progress
+    @Published var downloadProgress: [String: Double] = [:]
+    
+    // Add a property to track downloaded video info
+    private let downloadedVideosKey = "downloadedVideos"
+    
+    // Add property to store observation
+    private var progressObservation: NSKeyValueObservation?
+    
+    private var documentsDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+    
+    private var videosDirectory: URL {
+        let directory = documentsDirectory.appendingPathComponent("Videos")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
     
     struct VideoItem: Identifiable {
         let id: String
@@ -16,7 +35,8 @@ class VideoPlayerModel: NSObject, ObservableObject {
         let thumbnailURL: URL?
         
         init(url: URL, title: String, isLocal: Bool, thumbnailURL: URL? = nil) {
-            self.id = title
+            // Create a unique ID that combines title and local/remote status
+            self.id = isLocal ? "local-\(title)" : "remote-\(title)"
             self.url = url
             self.title = title
             self.isLocal = isLocal
@@ -29,8 +49,12 @@ class VideoPlayerModel: NSObject, ObservableObject {
         super.init()
         setupPlayerObserver()
         
+        // Load bundled videos first
         loadBundledVideos()
-        print("Loaded \(videos.count) bundled videos")
+        // Then load any previously downloaded videos
+        loadDownloadedVideos()
+        
+        print("Loaded \(videos.count) total videos")
         
         if !UserDefaults.standard.bool(forKey: "hasLaunchedBefore") {
             print("First launch - selecting all local videos")
@@ -63,19 +87,28 @@ class VideoPlayerModel: NSObject, ObservableObject {
                     self?.player.play()
                 }
             } else {
-                // Multiple videos - add finished video back to queue
-                if let urlAsset = finishedItem.asset as? AVURLAsset,
-                   let video = self.currentPlaylist.first(where: { $0.url == urlAsset.url }) {
-                    let newItem = AVPlayerItem(url: video.url)
-                    self.player.insert(newItem, after: self.player.items().last)
+                // Multiple videos - add the finished video back to the queue
+                if let urlAsset = finishedItem.asset as? AVURLAsset {
+                    // Find the video that just finished
+                    if let finishedVideo = self.currentPlaylist.first(where: { $0.url == urlAsset.url }) {
+                        print("Video finished: \(finishedVideo.title)")
+                        // Create a new item and add it to the end of the queue
+                        let newItem = AVPlayerItem(url: finishedVideo.url)
+                        self.player.insert(newItem, after: self.player.items().last)
+                        print("Re-added \(finishedVideo.title) to queue")
+                    }
                 }
-            }
-            
-            // Update title to the now-playing video
-            if let currentItem = self.player.currentItem,
-               let urlAsset = currentItem.asset as? AVURLAsset,
-               let currentVideo = self.currentPlaylist.first(where: { $0.url == urlAsset.url }) {
-                self.currentVideoTitle = currentVideo.title
+                
+                // Update the current video title
+                if let currentItem = self.player.currentItem,
+                   let urlAsset = currentItem.asset as? AVURLAsset,
+                   let currentVideo = self.currentPlaylist.first(where: { $0.url == urlAsset.url }) {
+                    self.currentVideoTitle = currentVideo.title
+                    print("Now playing: \(currentVideo.title)")
+                }
+                
+                // Ensure playback continues
+                self.player.play()
             }
         }
     }
@@ -101,6 +134,27 @@ class VideoPlayerModel: NSObject, ObservableObject {
                         let video = VideoItem(url: url, title: title, isLocal: true, thumbnailURL: thumbnailURL)
                         videos.append(video)
                     }
+                }
+            }
+        }
+    }
+    
+    private func loadDownloadedVideos() {
+        // Load info about previously downloaded videos
+        if let downloadedInfo = UserDefaults.standard.dictionary(forKey: downloadedVideosKey) as? [String: String] {
+            for (title, filename) in downloadedInfo {
+                let videoURL = videosDirectory.appendingPathComponent(filename)
+                if FileManager.default.fileExists(atPath: videoURL.path) {
+                    // Generate or load thumbnail
+                    let thumbnailURL = generateThumbnail(for: videoURL, title: title)
+                    
+                    let video = VideoItem(
+                        url: videoURL,
+                        title: title,
+                        isLocal: true,
+                        thumbnailURL: thumbnailURL
+                    )
+                    videos.append(video)
                 }
             }
         }
@@ -156,7 +210,11 @@ class VideoPlayerModel: NSObject, ObservableObject {
             player.replaceCurrentItem(with: item)
             player.actionAtItemEnd = .none // Prevents playback from stopping at end
         } else {
-            // Multiple videos - add them all to queue
+            // Multiple videos - add them all to queue and set to loop
+            print("Multiple videos mode - setting up queue with \(currentPlaylist.count) videos")
+            player.actionAtItemEnd = .advance // Ensure we advance to next item
+            
+            // Add each video to the queue
             for video in currentPlaylist {
                 print("Adding video to queue: \(video.title) at URL: \(video.url)")
                 let item = AVPlayerItem(url: video.url)
@@ -168,46 +226,135 @@ class VideoPlayerModel: NSObject, ObservableObject {
         currentVideoTitle = currentPlaylist[0].title
         print("Starting playback with: \(currentVideoTitle)")
         
-        // Force a play command and check player status
         player.play()
-        if player.timeControlStatus == .playing {
-            print("Player is playing")
-        } else {
-            print("Player failed to start playing. Status: \(player.timeControlStatus.rawValue)")
-        }
     }
     
     var remoteVideos: [VideoItem] {
         RemoteVideos.videos
     }
     
+    // Add a helper function to check if a video is already downloaded
+    private func isVideoDownloaded(_ video: VideoItem) -> Bool {
+        return videos.contains { $0.title == video.title }
+    }
+    
+    // Add a function to get the local version of a video if it exists
+    private func getLocalVersion(_ video: VideoItem) -> VideoItem? {
+        return videos.first { $0.title == video.title }
+    }
+    
     func downloadAndAddVideo(_ video: VideoItem, completion: @escaping (Bool) -> Void) {
-        URLSession.shared.dataTask(with: video.url) { [weak self] data, response, error in
-            guard let self = self,
-                  let data = data,
-                  error == nil else {
+        print("=== Download Process Started ===")
+        print("Video: \(video.title)")
+        print("URL: \(video.url)")
+        print("ID: \(video.id)")
+        
+        // Check if already downloaded
+        if let existingVideo = getLocalVersion(video) {
+            print("Video already exists locally:")
+            print("- Local URL: \(existingVideo.url)")
+            print("- Thumbnail URL: \(existingVideo.thumbnailURL?.absoluteString ?? "none")")
+            DispatchQueue.main.async {
+                completion(true)
+            }
+            return
+        }
+        
+        print("Starting new download...")
+        let videoTitle = video.title
+        videos.removeAll { $0.title == videoTitle }
+        
+        let downloadTask = URLSession.shared.downloadTask(with: video.url) { [weak self] tempURL, response, error in
+            if let error = error {
+                print("❌ Download failed with error: \(error.localizedDescription)")
                 DispatchQueue.main.async {
+                    self?.downloadProgress[video.id] = nil
                     completion(false)
                 }
                 return
             }
             
-            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(video.url.lastPathComponent)
-            try? data.write(to: tempURL)
-            
-            // Generate thumbnail for downloaded video
-            let thumbnailURL = generateThumbnail(for: tempURL, title: video.title)
-            
-            let localVideo = VideoItem(url: tempURL,
-                                     title: video.title,
-                                     isLocal: true,
-                                     thumbnailURL: thumbnailURL)
-            
-            DispatchQueue.main.async {
-                self.videos.append(localVideo)
-                completion(true)
+            guard let response = response as? HTTPURLResponse else {
+                print("❌ Invalid response type")
+                return
             }
-        }.resume()
+            print("📥 Response received:")
+            print("- Status code: \(response.statusCode)")
+            print("- MIMEType: \(response.mimeType ?? "unknown")")
+            print("- Expected length: \(response.expectedContentLength)")
+            
+            guard let tempURL = tempURL else {
+                print("❌ No temporary URL received")
+                DispatchQueue.main.async {
+                    self?.downloadProgress[video.id] = nil
+                    completion(false)
+                }
+                return
+            }
+            
+            print("📁 Temporary file received at: \(tempURL)")
+            
+            do {
+                let filename = video.url.lastPathComponent
+                let finalURL = self?.videosDirectory.appendingPathComponent(filename) ?? tempURL
+                print("Moving file to: \(finalURL)")
+                
+                try FileManager.default.moveItem(at: tempURL, to: finalURL)
+                print("✅ File moved successfully")
+                
+                print("Generating thumbnail...")
+                let thumbnailURL = self?.generateThumbnail(for: finalURL, title: video.title)
+                print("Thumbnail result: \(thumbnailURL?.absoluteString ?? "failed")")
+                
+                let localVideo = VideoItem(
+                    url: finalURL,
+                    title: video.title,
+                    isLocal: true,
+                    thumbnailURL: thumbnailURL
+                )
+                
+                print("Saving to UserDefaults...")
+                if var downloadedInfo = UserDefaults.standard.dictionary(forKey: self?.downloadedVideosKey ?? "") as? [String: String] {
+                    downloadedInfo[video.title] = filename
+                    UserDefaults.standard.set(downloadedInfo, forKey: self?.downloadedVideosKey ?? "")
+                } else {
+                    UserDefaults.standard.set([video.title: filename], forKey: self?.downloadedVideosKey ?? "")
+                }
+                print("✅ Saved to UserDefaults")
+                
+                DispatchQueue.main.async {
+                    print("Completing download process...")
+                    self?.downloadProgress[video.id] = nil
+                    self?.videos.append(localVideo)
+                    print("✅ Download complete and video added to library")
+                    completion(true)
+                }
+            } catch {
+                print("❌ Error handling downloaded file:")
+                print(error)
+                DispatchQueue.main.async {
+                    self?.downloadProgress[video.id] = nil
+                    completion(false)
+                }
+            }
+            
+            print("Cleaning up progress observation")
+            self?.progressObservation?.invalidate()
+            self?.progressObservation = nil
+        }
+        
+        print("Setting up progress observation...")
+        progressObservation?.invalidate()
+        progressObservation = downloadTask.progress.observe(\.fractionCompleted) { [weak self] progress, _ in
+            DispatchQueue.main.async {
+                let percentage = progress.fractionCompleted * 100
+                print("📊 Download progress: \(String(format: "%.1f", percentage))%")
+                self?.downloadProgress[video.id] = progress.fractionCompleted
+            }
+        }
+        
+        print("Starting download task...")
+        downloadTask.resume()
     }
     
     func updateSelectedVideos(_ selectedVideos: [VideoItem]) {
@@ -221,6 +368,7 @@ class VideoPlayerModel: NSObject, ObservableObject {
     
     deinit {
         NotificationCenter.default.removeObserver(self)
+        progressObservation?.invalidate()
     }
 }
 
