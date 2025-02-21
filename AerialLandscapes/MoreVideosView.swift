@@ -31,22 +31,48 @@ struct MoreVideosView: View {
         return orderedVideos
     }
     
+    // Group videos by section
+    var videosBySection: [(String, [VideoPlayerModel.VideoItem])] {
+        let grouped = Dictionary(grouping: allVideos) { $0.section }
+        return grouped
+            .map { (section, videos) in
+                // Sort videos alphabetically within each section
+                let sortedVideos = videos.sorted { $0.title < $1.title }
+                return (section, sortedVideos)
+            }
+            .sorted { $0.0 < $1.0 } // Sort sections alphabetically
+    }
+    
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 40), count: 4), spacing: 40) {
-                ForEach(allVideos) { video in
-                    VideoItemView(
-                        videoPlayerModel: videoPlayerModel,
-                        video: video,
-                        isSelected: selectedVideoIds.contains(video.id),
-                        isDownloading: downloadingVideoIds.contains(video.id)
-                    ) {
-                        toggleVideo(video)
+            VStack(alignment: .leading, spacing: 40) {
+                ForEach(videosBySection, id: \.0) { section, videos in
+                    VStack(alignment: .leading, spacing: 20) {
+                        // Section Header
+                        Text(section)
+                            .font(.title2)
+                            .fontWeight(.bold)
+                            .foregroundColor(.white)
+                            .padding(.leading, 60)
+                        
+                        // Videos Grid
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 40), count: 4), spacing: 40) {
+                            ForEach(videos) { video in
+                                VideoItemView(
+                                    videoPlayerModel: videoPlayerModel,
+                                    video: video,
+                                    isSelected: selectedVideoIds.contains(video.id),
+                                    isDownloading: downloadingVideoIds.contains(video.id)
+                                ) {
+                                    toggleVideo(video)
+                                }
+                                .focused($focusedVideoId, equals: video.id)
+                            }
+                        }
                     }
-                    .focused($focusedVideoId, equals: video.id)
                 }
             }
-            .padding(60)
+            .padding(.vertical, 60)
         }
         .onAppear {
             // Load selected videos from UserDefaults

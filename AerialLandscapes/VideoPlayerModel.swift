@@ -1,6 +1,12 @@
 import SwiftUI
 import AVKit
 
+private struct BundledVideo {
+    let filename: String
+    let title: String
+    let section: String
+}
+
 class VideoPlayerModel: NSObject, ObservableObject {
     @Published var currentVideoTitle: String = ""
     let player: AVQueuePlayer
@@ -27,20 +33,36 @@ class VideoPlayerModel: NSObject, ObservableObject {
         return directory
     }
     
+    private let bundledVideos: [BundledVideo] = [
+        // California Videos
+        BundledVideo(filename: "Fort Funston", title: "Fort Funston", section: "California"),
+        BundledVideo(filename: "Waves", title: "Waves", section: "California"),
+        BundledVideo(filename: "Stanford Main Quad", title: "Stanford Main Quad", section: "California"),
+        BundledVideo(filename: "Sather Tower", title: "Sather Tower", section: "California"),
+        BundledVideo(filename: "Salt Flats", title: "Salt Flats", section: "California"),
+        
+        // International Videos
+        BundledVideo(filename: "TestAlps", title: "Test Alps", section: "International"),
+        BundledVideo(filename: "TestHvar", title: "Test Hvar", section: "International"),
+        BundledVideo(filename: "TestCopa", title: "Test Copa", section: "International"),
+        BundledVideo(filename: "TestValencia", title: "Test Valencia", section: "International")
+    ]
+    
     struct VideoItem: Identifiable {
         let id: String
         let url: URL
         let title: String
         let isLocal: Bool
         let thumbnailURL: URL?
+        let section: String
         
-        init(url: URL, title: String, isLocal: Bool, thumbnailURL: URL? = nil) {
-            // Create a unique ID that combines title and local/remote status
+        init(url: URL, title: String, isLocal: Bool, thumbnailURL: URL? = nil, section: String) {
             self.id = isLocal ? "local-\(title)" : "remote-\(title)"
             self.url = url
             self.title = title
             self.isLocal = isLocal
             self.thumbnailURL = thumbnailURL
+            self.section = section
         }
     }
     
@@ -115,25 +137,23 @@ class VideoPlayerModel: NSObject, ObservableObject {
     
     private func loadBundledVideos() {
         if let resourcePath = Bundle.main.resourcePath {
-            let enumerator = FileManager.default.enumerator(atPath: resourcePath)
-            print("All resources in bundle:")
-            while let filePath = enumerator?.nextObject() as? String {
-                let lowercasePath = filePath.lowercased()
-                if lowercasePath.hasSuffix(".mov") || lowercasePath.hasSuffix(".mp4") {
-                    print("Found video: \(filePath)")
-                    let filename = (filePath as NSString).deletingPathExtension
-                    let fileExtension = (filePath as NSString).pathExtension
+            for bundledVideo in bundledVideos {
+                // Check if the video file exists
+                if let url = Bundle.main.url(forResource: bundledVideo.filename, withExtension: "mov") ??
+                           Bundle.main.url(forResource: bundledVideo.filename, withExtension: "mp4") {
+                    print("Found video: \(bundledVideo.filename)")
                     
-                    if let url = Bundle.main.url(forResource: filename, withExtension: fileExtension) {
-                        let title = url.deletingPathExtension().lastPathComponent
-                            .replacingOccurrences(of: "-", with: " ")
-                        
-                        // Generate thumbnail
-                        let thumbnailURL = generateThumbnail(for: url, title: title)
-                        
-                        let video = VideoItem(url: url, title: title, isLocal: true, thumbnailURL: thumbnailURL)
-                        videos.append(video)
-                    }
+                    // Generate thumbnail
+                    let thumbnailURL = generateThumbnail(for: url, title: bundledVideo.title)
+                    
+                    let video = VideoItem(
+                        url: url,
+                        title: bundledVideo.title,
+                        isLocal: true,
+                        thumbnailURL: thumbnailURL,
+                        section: bundledVideo.section
+                    )
+                    videos.append(video)
                 }
             }
         }
@@ -148,11 +168,15 @@ class VideoPlayerModel: NSObject, ObservableObject {
                     // Generate or load thumbnail
                     let thumbnailURL = generateThumbnail(for: videoURL, title: title)
                     
+                    // Find the original video's section from remote videos
+                    let section = remoteVideos.first { $0.title == title }?.section ?? "California"
+                    
                     let video = VideoItem(
                         url: videoURL,
                         title: title,
                         isLocal: true,
-                        thumbnailURL: thumbnailURL
+                        thumbnailURL: thumbnailURL,
+                        section: section
                     )
                     videos.append(video)
                 }
@@ -161,28 +185,54 @@ class VideoPlayerModel: NSObject, ObservableObject {
     }
     
     private func generateThumbnail(for videoURL: URL, title: String) -> URL? {
+        print("Starting thumbnail generation for: \(title)")
+        print("Video URL: \(videoURL)")
+        
         let asset = AVAsset(url: videoURL)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.maximumSize = CGSize(width: 1920, height: 1080)
         
-        // Get thumbnail from first frame
-        let time = CMTime(seconds: 0, preferredTimescale: 1)
+        // Use a later timestamp for test videos
+        let time = title.contains("Test") ? 
+            CMTime(seconds: 5, preferredTimescale: 600) :  // 5 seconds in for test videos
+            CMTime(seconds: 1, preferredTimescale: 600)    // 1 second for other videos
         
         do {
+            print("Attempting to generate thumbnail image...")
             let cgImage = try imageGenerator.copyCGImage(at: time, actualTime: nil)
             let uiImage = UIImage(cgImage: cgImage)
             
             // Create a URL in the cache directory for the thumbnail
             let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             let thumbnailURL = cacheDirectory.appendingPathComponent("\(title)_thumbnail.jpg")
+            print("Thumbnail will be saved to: \(thumbnailURL)")
             
             // Convert UIImage to JPEG data and write to file
-            if let imageData = uiImage.jpegData(compressionQuality: 0.8) {
+            if let imageData = uiImage.jpegData(compressionQuality: 0.9) {  // Increased quality
                 try imageData.write(to: thumbnailURL)
+                print("✅ Successfully generated and saved thumbnail for: \(title)")
                 return thumbnailURL
             }
         } catch {
-            print("Error generating thumbnail for \(title): \(error)")
+            print("❌ Error generating thumbnail for \(title): \(error)")
+            
+            // Try again with a different time if first attempt failed
+            do {
+                let fallbackTime = CMTime(seconds: 2, preferredTimescale: 600)
+                let cgImage = try imageGenerator.copyCGImage(at: fallbackTime, actualTime: nil)
+                let uiImage = UIImage(cgImage: cgImage)
+                let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                let thumbnailURL = cacheDirectory.appendingPathComponent("\(title)_thumbnail.jpg")
+                
+                if let imageData = uiImage.jpegData(compressionQuality: 0.9) {
+                    try imageData.write(to: thumbnailURL)
+                    print("✅ Successfully generated thumbnail on second attempt for: \(title)")
+                    return thumbnailURL
+                }
+            } catch {
+                print("❌ Failed second thumbnail generation attempt for \(title): \(error)")
+            }
         }
         
         return nil
@@ -310,7 +360,8 @@ class VideoPlayerModel: NSObject, ObservableObject {
                     url: finalURL,
                     title: video.title,
                     isLocal: true,
-                    thumbnailURL: thumbnailURL
+                    thumbnailURL: thumbnailURL,
+                    section: video.section
                 )
                 
                 print("Saving to UserDefaults...")
