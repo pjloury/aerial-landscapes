@@ -23,6 +23,9 @@ class VideoPlayerModel: NSObject, ObservableObject {
     // Add property to store observation
     private var progressObservation: NSKeyValueObservation?
     
+    // Add S3 service
+    private let s3VideoService = S3VideoService()
+    
     private var documentsDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
@@ -75,6 +78,8 @@ class VideoPlayerModel: NSObject, ObservableObject {
         loadBundledVideos()
         // Then load any previously downloaded videos
         loadDownloadedVideos()
+        // Fetch available remote videos
+        s3VideoService.fetchAvailableVideos()
         
         print("Loaded \(videos.count) total videos")
         
@@ -188,53 +193,41 @@ class VideoPlayerModel: NSObject, ObservableObject {
         print("Starting thumbnail generation for: \(title)")
         print("Video URL: \(videoURL)")
         
-        let asset = AVAsset(url: videoURL)
+        let asset = AVURLAsset(url: videoURL)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.maximumSize = CGSize(width: 1920, height: 1080)
         
-        // Use a later timestamp for test videos
         let time = title.contains("Test") ? 
-            CMTime(seconds: 5, preferredTimescale: 600) :  // 5 seconds in for test videos
-            CMTime(seconds: 1, preferredTimescale: 600)    // 1 second for other videos
+            CMTime(seconds: 5, preferredTimescale: 600) :
+            CMTime(seconds: 1, preferredTimescale: 600)
         
-        do {
-            print("Attempting to generate thumbnail image...")
-            let cgImage = try imageGenerator.copyCGImage(at: time, actualTime: nil)
+        // Use async thumbnail generation
+        let semaphore = DispatchSemaphore(value: 0)
+        var thumbnailImage: CGImage?
+        
+        imageGenerator.generateCGImageAsynchronously(for: time) { cgImage, actualTime, error in
+            if let image = cgImage {
+                thumbnailImage = image
+            }
+            semaphore.signal()
+        }
+        
+        _ = semaphore.wait(timeout: .now() + 5.0)
+        
+        if let cgImage = thumbnailImage {
             let uiImage = UIImage(cgImage: cgImage)
-            
-            // Create a URL in the cache directory for the thumbnail
             let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             let thumbnailURL = cacheDirectory.appendingPathComponent("\(title)_thumbnail.jpg")
-            print("Thumbnail will be saved to: \(thumbnailURL)")
             
-            // Convert UIImage to JPEG data and write to file
-            if let imageData = uiImage.jpegData(compressionQuality: 0.9) {  // Increased quality
-                try imageData.write(to: thumbnailURL)
+            if let imageData = uiImage.jpegData(compressionQuality: 0.9) {
+                try? imageData.write(to: thumbnailURL)
                 print("✅ Successfully generated and saved thumbnail for: \(title)")
                 return thumbnailURL
             }
-        } catch {
-            print("❌ Error generating thumbnail for \(title): \(error)")
-            
-            // Try again with a different time if first attempt failed
-            do {
-                let fallbackTime = CMTime(seconds: 2, preferredTimescale: 600)
-                let cgImage = try imageGenerator.copyCGImage(at: fallbackTime, actualTime: nil)
-                let uiImage = UIImage(cgImage: cgImage)
-                let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-                let thumbnailURL = cacheDirectory.appendingPathComponent("\(title)_thumbnail.jpg")
-                
-                if let imageData = uiImage.jpegData(compressionQuality: 0.9) {
-                    try imageData.write(to: thumbnailURL)
-                    print("✅ Successfully generated thumbnail on second attempt for: \(title)")
-                    return thumbnailURL
-                }
-            } catch {
-                print("❌ Failed second thumbnail generation attempt for \(title): \(error)")
-            }
         }
         
+        print("❌ Failed to generate thumbnail for \(title)")
         return nil
     }
     
@@ -280,7 +273,7 @@ class VideoPlayerModel: NSObject, ObservableObject {
     }
     
     var remoteVideos: [VideoItem] {
-        RemoteVideos.videos
+        s3VideoService.remoteVideos
     }
     
     // Add a helper function to check if a video is already downloaded
