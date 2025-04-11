@@ -7,6 +7,9 @@ struct MoreVideosView: View {
     @State private var downloadingVideoIds: Set<String> = []
     @FocusState private var focusedVideoId: String?
     
+    // Add state to track the last focused video
+    @State private var lastFocusedVideoId: String?
+    
     var allVideos: [VideoPlayerModel.VideoItem] {
         // Get the list of downloaded video titles
         let downloadedTitles = Set(videoPlayerModel.videos.map { $0.title })
@@ -88,14 +91,19 @@ struct MoreVideosView: View {
             if let firstVideo = allVideos.first {
                 focusedVideoId = firstVideo.id
             }
+            
+            videoPlayerModel.debugThumbnails()
         }
     }
     
     private func toggleVideo(_ video: VideoPlayerModel.VideoItem) {
+        // Store the current focused video ID before any updates
+        lastFocusedVideoId = focusedVideoId
+        
         if selectedVideoIds.contains(video.id) {
             // Prevent toggling off if this is the last selected local video
-            let selectedLocalVideos = allVideos.filter { 
-                $0.isLocal && selectedVideoIds.contains($0.id)
+            let selectedLocalVideos = allVideos.filter { selectedVideo in 
+                selectedVideo.isLocal && selectedVideoIds.contains(selectedVideo.id)
             }
             if selectedLocalVideos.count <= 1 && video.isLocal {
                 return // Don't allow toggling off the last video
@@ -106,29 +114,27 @@ struct MoreVideosView: View {
             if video.isLocal {
                 selectedVideoIds.insert(video.id)
             } else {
-                // Check if we already have a local version
-                if let localVersion = videoPlayerModel.videos.first(where: { $0.title == video.title }) {
-                    // Use the local version's ID
-                    selectedVideoIds.insert(localVersion.id)
-                    // Update the video player immediately
-                    let selectedVideos = allVideos.filter { video in
-                        video.isLocal && selectedVideoIds.contains(video.id)
-                    }
-                    videoPlayerModel.updateSelectedVideos(selectedVideos)
-                } else {
-                    // Start download for new video
-                    downloadingVideoIds.insert(video.id)
-                    videoPlayerModel.downloadAndAddVideo(video) { success in
+                // Start download for new video
+                downloadingVideoIds.insert(video.id)
+                videoPlayerModel.downloadAndAddVideo(video) { success in
+                    DispatchQueue.main.async {
                         downloadingVideoIds.remove(video.id)
                         if success {
                             // Find the newly added local version
-                            if let localVersion = videoPlayerModel.videos.first(where: { $0.title == video.title }) {
+                            if let localVersion = videoPlayerModel.videos.first(where: { localVideo in
+                                localVideo.title == video.title
+                            }) {
                                 selectedVideoIds.insert(localVersion.id)
                                 // Update the video player
-                                let selectedVideos = allVideos.filter { video in
-                                    video.isLocal && selectedVideoIds.contains(video.id)
+                                let selectedVideos = allVideos.filter { selectedVideo in
+                                    selectedVideo.isLocal && selectedVideoIds.contains(selectedVideo.id)
                                 }
                                 videoPlayerModel.updateSelectedVideos(selectedVideos)
+                                
+                                // Restore focus to the last focused video
+                                if let lastId = lastFocusedVideoId {
+                                    focusedVideoId = lastId
+                                }
                             }
                         }
                     }
@@ -137,8 +143,8 @@ struct MoreVideosView: View {
         }
         
         // Update the video player with only local selected videos
-        let selectedVideos = allVideos.filter { video in
-            video.isLocal && selectedVideoIds.contains(video.id)
+        let selectedVideos = allVideos.filter { selectedVideo in
+            selectedVideo.isLocal && selectedVideoIds.contains(selectedVideo.id)
         }
         videoPlayerModel.updateSelectedVideos(selectedVideos)
     }
@@ -154,17 +160,39 @@ struct VideoItemView: View {
     var body: some View {
         Button(action: action) {
             VStack(spacing: 12) {
-                // Thumbnail
-                AsyncImage(url: video.thumbnailURL) { image in
-                    image
-                        .resizable()
-                        .aspectRatio(16/9, contentMode: .fill)
-                } placeholder: {
-                    Rectangle()
-                        .fill(Color.gray.opacity(0.3))
+                // Thumbnail with loading overlay
+                ZStack {
+                    AsyncImage(url: video.thumbnailURL) { image in
+                        image
+                            .resizable()
+                            .aspectRatio(16/9, contentMode: .fill)
+                    } placeholder: {
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.3))
+                    }
+                    .aspectRatio(16/9, contentMode: .fit)
+                    .cornerRadius(8)
+                    
+                    // Show progress overlay when downloading
+                    if isDownloading {
+                        Rectangle()
+                            .fill(Color.black.opacity(0.7))
+                        if let progress = videoPlayerModel.downloadProgress[video.id] {
+                            VStack {
+                                ProgressView(value: progress)
+                                    .progressViewStyle(.linear)
+                                    .tint(.accentColor)
+                                Text("\(Int(progress * 100))%")
+                                    .foregroundColor(.white)
+                            }
+                            .padding()
+                        } else {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(.white)
+                        }
+                    }
                 }
-                .aspectRatio(16/9, contentMode: .fit)
-                .cornerRadius(8)
                 
                 // Title and Selection Status
                 HStack(alignment: .center) {
@@ -177,23 +205,26 @@ struct VideoItemView: View {
                     
                     Spacer()
                     
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 24))
-                        .foregroundColor(isSelected ? .white : .gray)
+                    if isDownloading {
+                        // Show download progress
+                        if let progress = videoPlayerModel.downloadProgress[video.id] {
+                            Text("\(Int(progress * 100))%")
+                                .foregroundColor(.gray)
+                        }
+                    } else {
+                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 24))
+                            .foregroundColor(isSelected ? .white : .gray)
+                    }
                 }
                 .frame(height: 60)
-                
-                if isDownloading {
-                    ProgressView(value: videoPlayerModel.downloadProgress[video.id] ?? 0)
-                        .progressViewStyle(.linear)
-                        .tint(.accentColor)
-                }
             }
             .padding(16)
             .background(Color.black.opacity(0.3))
             .cornerRadius(12)
         }
         .buttonStyle(.card)
+        .disabled(isDownloading)
     }
 }
 
