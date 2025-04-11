@@ -3,8 +3,13 @@ import CommonCrypto
 import AVFoundation
 import UIKit
 
+enum VideoFetchResult {
+    case success([VideoPlayerModel.VideoItem])
+    case failure(Error)
+}
+
 class S3VideoService: ObservableObject {
-    private let s3Service: S3Service
+    let s3Service: S3Service
     @Published var remoteVideos: [VideoPlayerModel.VideoItem] = []
     private let thumbnailCache: ThumbnailCache
     
@@ -18,73 +23,53 @@ class S3VideoService: ObservableObject {
         self.thumbnailCache = ThumbnailCache()
     }
     
-    func fetchAvailableVideos() {
-        print("=== Starting S3 Bucket List Operation ===")
-        print("Bucket: \(s3Service.bucketName)")
-        print("Region: \(s3Service.region)")
+    func fetchAvailableVideos(completion: @escaping (VideoFetchResult) -> Void) {
+        print("\n=== 📱 Fetching Available S3 Videos ===")
         
         s3Service.listObjects { [weak self] result in
             if let (urls, thumbnails) = result {
-                print("\n✅ Successfully retrieved \(urls.count) objects from S3")
-                print("📸 Found \(thumbnails.count) thumbnail images")
-                
-                // Process only video files
+                // Process video files and match with thumbnails
                 let videoURLs = urls.filter { url in
                     let lowercasePath = url.lastPathComponent.lowercased()
                     return lowercasePath.hasSuffix(".mp4") || lowercasePath.hasSuffix(".mov")
                 }
-                print("\nFound \(videoURLs.count) video files:")
-                videoURLs.forEach { print("📹 \($0.lastPathComponent)") }
                 
-                // Convert URLs to VideoItems with thumbnails
-                let videos = videoURLs.map { url in
+                print("\n📹 Found \(videoURLs.count) videos in S3:")
+                print("\n🖼 Found \(thumbnails.count) thumbnails in S3:")
+                
+                // Create videos and download their thumbnails
+                let validVideos = videoURLs.compactMap { url -> VideoPlayerModel.VideoItem? in
                     let title = url.deletingPathExtension().lastPathComponent
                         .replacingOccurrences(of: "+", with: " ")
                     
-                    // Get thumbnail URL if it exists
-                    let thumbnailURL = thumbnails[title]
-                    print("\n🔍 Processing video: \(title)")
-                    print("🖼️ Thumbnail found: \(thumbnailURL != nil)")
-                    
-                    if let thumbURL = thumbnailURL {
-                        // Download and cache the thumbnail
-                        self?.downloadAndCacheThumbnail(from: thumbURL, for: title)
-                    } else {
-                        print("⚠️ No thumbnail found for: \(title)")
+                    guard let thumbnailURL = thumbnails[title] else {
+                        print("⚠️ Warning: No thumbnail found for video: \(title)")
+                        return nil
                     }
                     
-                    // Check if we have a cached version
-                    let cachedThumbURL = self?.thumbnailCache.getCachedThumbnailURL(for: title)
-                    if cachedThumbURL != nil {
-                        print("✅ Using cached thumbnail for: \(title)")
-                    }
+                    let section = self?.determineSection(title) ?? "International"
                     
-                    // Determine section based on title
-                    let section = self?.determineSection(title) ?? "California"
+                    print("✅ Matched video and thumbnail for: \(title)")
+                    print("   Video URL: \(url)")
+                    print("   Thumbnail URL: \(thumbnailURL)")
                     
+                    // Start thumbnail download immediately
+                    self?.downloadAndCacheThumbnail(from: thumbnailURL, for: title)
+                    
+                    // Initially return video with S3 thumbnail URL
                     return VideoPlayerModel.VideoItem(
                         url: url,
                         title: title,
                         isLocal: false,
-                        thumbnailURL: cachedThumbURL ?? thumbnailURL,
+                        thumbnailURL: self?.thumbnailCache.getCachedThumbnailURL(for: title) ?? thumbnailURL,
                         section: section
                     )
                 }
                 
-                DispatchQueue.main.async {
-                    self?.remoteVideos = videos
-                    print("\n📊 Summary:")
-                    print("Total videos: \(videos.count)")
-                    videos.forEach { video in
-                        print("- \(video.title)")
-                        print("  Section: \(video.section)")
-                        print("  Thumbnail: \(video.thumbnailURL?.absoluteString ?? "none")")
-                    }
-                }
+                completion(.success(validVideos))
             } else {
-                print("❌ Failed to retrieve objects from S3")
+                completion(.failure(NSError(domain: "S3VideoService", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to retrieve videos from S3"])))
             }
-            self?.testS3Access()
         }
     }
     
@@ -107,20 +92,6 @@ class S3VideoService: ObservableObject {
                 return
             }
             
-            if let httpResponse = response as? HTTPURLResponse {
-                print("📡 Response status: \(httpResponse.statusCode)")
-                // Accept both 200 (OK) and 206 (Partial Content) as success
-                if httpResponse.statusCode != 200 && httpResponse.statusCode != 206 {
-                    print("⚠️ Unexpected status code")
-                    print("Response Headers:")
-                    httpResponse.allHeaderFields.forEach { print("\($0): \($1)") }
-                    if let data = data, let errorString = String(data: data, encoding: .utf8) {
-                        print("Error Response: \(errorString)")
-                    }
-                    return
-                }
-            }
-            
             guard let imageData = data else {
                 print("❌ No image data received for \(videoTitle)")
                 return
@@ -134,7 +105,7 @@ class S3VideoService: ObservableObject {
                 
                 // Update the video item with the cached thumbnail URL
                 DispatchQueue.main.async {
-                    self?.updateThumbnail(for: videoTitle, with: thumbnailURL)
+                    self?.updateRemoteVideoThumbnail(for: videoTitle, with: thumbnailURL)
                     print("✅ Updated UI with cached thumbnail for \(videoTitle)")
                 }
             } else {
@@ -145,14 +116,35 @@ class S3VideoService: ObservableObject {
         task.resume()
     }
     
+    private func updateRemoteVideoThumbnail(for videoTitle: String, with thumbnailURL: URL) {
+        // Find and update the video item with the new thumbnail
+        if let index = remoteVideos.firstIndex(where: { $0.title == videoTitle }) {
+            let video = remoteVideos[index]
+            remoteVideos[index] = VideoPlayerModel.VideoItem(
+                url: video.url,
+                title: video.title,
+                isLocal: video.isLocal,
+                thumbnailURL: thumbnailURL,
+                section: video.section
+            )
+        }
+    }
+    
     private func determineSection(_ title: String) -> String {
-        // Add California locations here
+        // California locations
         let californiaKeywords = [
-            "San Francisco", "Embarcadero", "Fort Funston", "Marin", "Stanford",
-            "Salt Flats", "Sather", "Alabama Hills", "Northern Marin"
+            "San Francisco", "Embarcadero", "Fort Funston", "Marin",
+            "Stanford", "Salt Flats", "Sather", "Alabama Hills",
+            "Northern Marin", "California"
         ]
         
-        return californiaKeywords.contains { title.contains($0) } ? "California" : "International"
+        // Check if the title contains any California keywords
+        if californiaKeywords.contains(where: { title.contains($0) }) {
+            return "California"
+        }
+        
+        // All other videos go to International
+        return "International"
     }
     
     private func generateMissingThumbnails(for videos: [VideoPlayerModel.VideoItem]) {
@@ -344,10 +336,26 @@ class S3VideoService: ObservableObject {
             }
         }.resume()
     }
+    
+    func refreshThumbnails(forceRefresh: Bool = false) {
+        print("\n🔄 Refreshing thumbnails...")
+        print("Force refresh: \(forceRefresh)")
+        
+        for video in remoteVideos {
+            if forceRefresh || thumbnailCache.getCachedThumbnailURL(for: video.title) == nil {
+                if let thumbnailURL = video.thumbnailURL {
+                    print("Downloading thumbnail for: \(video.title)")
+                    downloadAndCacheThumbnail(from: thumbnailURL, for: video.title)
+                }
+            } else {
+                print("Skipping cached thumbnail for: \(video.title)")
+            }
+        }
+    }
 }
 
 // S3Service implementation
-private struct S3Service {
+struct S3Service {
     let accessKey: String
     let secretKey: String
     let region: String
