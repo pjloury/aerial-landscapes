@@ -150,8 +150,6 @@ class VideoPlayerModel: NSObject, ObservableObject {
             guard let self = self,
                   let finishedItem = notification.object as? AVPlayerItem else { return }
             
-            print("\n🔄 Video finished playing")
-            
             guard !currentPlaylist.isEmpty else { return }
             
             // Remove the finished item
@@ -176,8 +174,6 @@ class VideoPlayerModel: NSObject, ObservableObject {
                 if let currentItem = self.player.currentItem,
                    let currentVideo = self.getVideo(from: currentItem) {
                     self.currentVideoTitle = currentVideo.displayTitle
-                    print("▶️ Now playing: \(currentVideo.displayTitle)")
-                    print("Queue position: \(self.currentPlaylistIndex + 1) of \(self.currentPlaylist.count)")
                 }
             }
         }
@@ -193,16 +189,12 @@ class VideoPlayerModel: NSObject, ObservableObject {
                   let currentVideo = self.getVideo(from: currentItem) else { return }
             
             self.currentVideoTitle = currentVideo.displayTitle
-            print("🎵 Current item changed to: \(currentVideo.displayTitle)")
         }
     }
     
     func updateSelectedVideos(_ videos: [Video]) {
-        print("\n🎬 Updating playlist")
-        
         let selectedVideos = self.selectedVideos
         guard !selectedVideos.isEmpty else {
-            print("❌ No videos selected")
             player.removeAllItems()
             currentVideoTitle = ""
             currentPlaylistIndex = 0
@@ -219,15 +211,8 @@ class VideoPlayerModel: NSObject, ObservableObject {
         // Store the shuffled order
         currentPlaylist = shuffledVideos
         
-        print("📋 Adding \(shuffledVideos.count) videos to queue:")
-        print("Playlist order:")
-        shuffledVideos.enumerated().forEach { index, video in
-            print("\(index + 1). \(video.displayTitle)")
-        }
-        
         // Add all selected videos to queue
         for video in shuffledVideos {
-            print("➕ Adding to queue: \(video.displayTitle)")
             let playerItem = AVPlayerItem(url: video.url)
             player.insert(playerItem, after: player.items().last)
             addPlayerItemObserver(playerItem, title: video.displayTitle)
@@ -237,7 +222,6 @@ class VideoPlayerModel: NSObject, ObservableObject {
         if let firstVideo = shuffledVideos.first {
             // Update title immediately before starting playback
             currentVideoTitle = firstVideo.displayTitle
-            print("▶️ Starting playback with: \(firstVideo.displayTitle)")
             
             // Ensure we're at the start of the video
             player.seek(to: .zero)
@@ -274,30 +258,11 @@ class VideoPlayerModel: NSObject, ObservableObject {
         if let item = object as? AVPlayerItem {
             switch keyPath {
             case #keyPath(AVPlayerItem.status):
-                let status = AVPlayerItem.Status(rawValue: change?[.newKey] as? Int ?? 0)
-                print("\n📺 Player item status changed:")
-                print("Status: \(status?.rawValue ?? -1)")
                 if let error = item.error {
                     print("Error: \(error.localizedDescription)")
                 }
-                
-            case #keyPath(AVPlayerItem.isPlaybackLikelyToKeepUp):
-                print("\n⚡️ Playback likely to keep up: \(item.isPlaybackLikelyToKeepUp)")
             default:
                 break
-            }
-        } else if let player = object as? AVPlayer, keyPath == #keyPath(AVPlayer.timeControlStatus) {
-            let status = AVPlayer.TimeControlStatus(rawValue: change?[.newKey] as? Int ?? 0)
-            print("\n⏯️ Player time control status changed: \(status?.rawValue ?? -1)")
-            switch status {
-            case .paused:
-                print("Player is paused")
-            case .waitingToPlayAtSpecifiedRate:
-                print("Player is waiting/buffering")
-            case .playing:
-                print("Player is playing")
-            default:
-                print("Unknown player status")
             }
         }
     }
@@ -305,8 +270,7 @@ class VideoPlayerModel: NSObject, ObservableObject {
     @objc private func playerItemFailedToPlay(_ notification: Notification) {
         if let item = notification.object as? AVPlayerItem,
            let error = item.error {
-            print("\n❌ Player item failed to play")
-            print("Error: \(error.localizedDescription)")
+            print("❌ Player item failed to play: \(error.localizedDescription)")
             
             if let urlAsset = item.asset as? AVURLAsset {
                 print("Failed URL: \(urlAsset.url)")
@@ -503,12 +467,6 @@ class VideoPlayerModel: NSObject, ObservableObject {
         
         // Update player playlist
         updateSelectedVideos(videos)
-        
-        // Debug logging
-        print("\n🎬 Video selection changed:")
-        print("Video: \(videoId)")
-        print("New state: \(!currentState)")
-        print("Currently selected: \(selectedVideos.map(\.displayTitle).joined(separator: ", "))")
     }
     
     // Add a method to get the current video from a player item

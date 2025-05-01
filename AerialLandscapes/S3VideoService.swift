@@ -75,7 +75,12 @@ class S3Service {
         let host = "\(bucketName).s3.\(region).amazonaws.com"
         let endpoint = "https://\(host)/"
         
-        // Create the signed request
+        print("\n🔍 S3 Request Details:")
+        print("Host: \(host)")
+        print("Endpoint: \(endpoint)")
+        print("Date: \(amzDate)")
+        
+        // Create the canonical request
         var request = URLRequest(url: URL(string: endpoint)!)
         request.httpMethod = "GET"
         request.setValue(host, forHTTPHeaderField: "Host")
@@ -118,25 +123,51 @@ class S3Service {
         
         request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
         
+        // Log request headers
+        print("\n📤 Request Headers:")
+        request.allHTTPHeaderFields?.forEach { key, value in
+            print("\(key): \(value)")
+        }
+        
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
+                print("\n❌ Network Error: \(error.localizedDescription)")
                 completion(.failure(error))
                 return
             }
             
-            guard let data = data else {
-                completion(.failure(NSError(domain: "S3Service", code: -1, userInfo: [NSLocalizedDescriptionKey: "No data received"])))
-                return
+            if let httpResponse = response as? HTTPURLResponse {
+                print("\n📥 Response Status: \(httpResponse.statusCode)")
+                print("Response Headers:")
+                httpResponse.allHeaderFields.forEach { key, value in
+                    print("\(key): \(value)")
+                }
             }
             
-            let parser = XMLParser(data: data)
-            let delegate = S3ParserDelegate(bucketName: self.bucketName, region: self.region)
-            parser.delegate = delegate
-            
-            if parser.parse() {
-                completion(.success(delegate.videos))
+            if let data = data {
+                print("\n📦 Response Data:")
+                if let xmlString = String(data: data, encoding: .utf8) {
+                    print(xmlString)
+                }
+                
+                let parser = XMLParser(data: data)
+                let delegate = S3ParserDelegate(bucketName: self.bucketName, region: self.region)
+                parser.delegate = delegate
+                
+                if parser.parse() {
+                    print("\n✅ Successfully parsed XML response")
+                    print("Found \(delegate.videos.count) videos")
+                    completion(.success(delegate.videos))
+                } else {
+                    print("\n❌ Failed to parse XML response")
+                    if let error = parser.parserError {
+                        print("Parser error: \(error)")
+                    }
+                    completion(.failure(NSError(domain: "S3Service", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse XML response"])))
+                }
             } else {
-                completion(.failure(NSError(domain: "S3Service", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse XML response"])))
+                print("\n❌ No data received from S3")
+                completion(.failure(NSError(domain: "S3Service", code: -1, userInfo: [NSLocalizedDescriptionKey: "No data received"])))
             }
         }
         
@@ -261,6 +292,7 @@ private class S3ParserDelegate: NSObject, XMLParserDelegate {
     }
     
     func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
+        print("📎 Parsing element: \(elementName)")
         currentElement = elementName
         
         switch elementName {
@@ -277,12 +309,15 @@ private class S3ParserDelegate: NSObject, XMLParserDelegate {
     func parser(_ parser: XMLParser, foundCharacters string: String) {
         if currentKey.isEmpty && currentElement == "Key" {
             currentKey = string
+            print("📄 Found key: \(string)")
         } else if isInMetadata {
             switch currentElement {
             case "x-amz-meta-display-title":
                 currentMetadata["display-title"] = string
+                print("📝 Found display title: \(string)")
             case "x-amz-meta-geozone":
                 currentMetadata["geozone"] = string
+                print("🌍 Found geozone: \(string)")
             default:
                 break
             }
