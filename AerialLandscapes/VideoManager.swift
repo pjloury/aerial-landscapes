@@ -5,6 +5,9 @@ import AVFoundation
 class VideoManager: ObservableObject {
     static let shared = VideoManager()
     
+    private let defaults = UserDefaults.standard
+    private let videosKey = "savedVideos"
+    
     @Published private(set) var videos: [Video] = [] {
         didSet {
             saveVideos()
@@ -12,10 +15,19 @@ class VideoManager: ObservableObject {
         }
     }
     
-    private init() {
-        // Load saved videos and selection state
-        if let savedVideos = loadVideos() {
+    init() {
+        // Restore saved videos from UserDefaults
+        if let savedData = defaults.data(forKey: videosKey),
+           let savedVideos = try? JSONDecoder().decode([Video].self, from: savedData) {
             videos = savedVideos
+            print("\n📂 Restored \(videos.count) saved videos:")
+            videos.forEach { video in
+                print("- \(video.displayTitle)")
+                print("  Remote Video URL: \(video.remoteVideoURL?.absoluteString ?? "nil")")
+                print("  Remote Thumbnail URL: \(video.remoteThumbnailURL?.absoluteString ?? "nil")")
+                print("  Local Video URL: \(video.localVideoPath ?? "nil")")
+                print("  Local Thumbnail: \(video.localThumbnailPath ?? "nil")")
+            }
         }
     }
     
@@ -117,20 +129,22 @@ class VideoManager: ObservableObject {
     }
     
     private func saveVideos() {
-        let videoData = try? JSONEncoder().encode(videos)
-        UserDefaults.standard.set(videoData, forKey: "savedVideos")
-    }
-    
-    private func loadVideos() -> [Video]? {
-        guard let videoData = UserDefaults.standard.data(forKey: "savedVideos"),
-              let savedVideos = try? JSONDecoder().decode([Video].self, from: videoData) else {
-            return nil
+        if let encodedData = try? JSONEncoder().encode(videos) {
+            defaults.set(encodedData, forKey: videosKey)
         }
-        return savedVideos
     }
     
     func updateVideos(_ newVideos: [Video]) {
-        videos = newVideos
-        objectWillChange.send()
+        // Preserve local paths and selection state when updating
+        var updatedVideos = newVideos
+        for (index, newVideo) in updatedVideos.enumerated() {
+            if let existingVideo = videos.first(where: { $0.id == newVideo.id }) {
+                updatedVideos[index].localVideoPath = existingVideo.localVideoPath
+                updatedVideos[index].localThumbnailPath = existingVideo.localThumbnailPath
+                updatedVideos[index].isSelected = existingVideo.isSelected
+            }
+        }
+        videos = updatedVideos
+        saveVideos()
     }
 } 

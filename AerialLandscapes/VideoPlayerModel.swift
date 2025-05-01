@@ -82,17 +82,14 @@ class VideoPlayerModel: NSObject, ObservableObject {
         // Get videos from VideoManager (single source of truth)
         videos = videoManager.videos
         
-        // Ensure thumbnails for all videos
-        videos.forEach { video in
-            _ = ensureThumbnail(for: video)
-        }
-        
-        // Debug logging
-        print("\n📱 Loaded \(videos.count) videos:")
-        print("Selected videos: \(selectedVideos.map(\.displayTitle).joined(separator: ", "))")
+        print("\n📱 Loading \(videos.count) videos from persistent storage:")
         videos.forEach { video in
             print("- \(video.displayTitle) (\(video.geozone)) [Selected: \(video.isSelected)]")
-            print("  Local URL: \(video.isLocal ? video.url.path : "Not downloaded")")
+            print("  Local Video Path: \(video.localVideoPath ?? "Not downloaded")")
+            print("  Local Video URL: \(video.url)")
+            print("  Local Thumbnail: \(video.localThumbnailPath ?? "Not downloaded")")
+            print("  Remote Video URL: \(video.remoteVideoURL?.absoluteString ?? "nil")")
+            print("  Remote Thumbnail URL: \(video.remoteThumbnailURL?.absoluteString ?? "nil")")
         }
         
         // Update player with currently selected videos
@@ -110,18 +107,19 @@ class VideoPlayerModel: NSObject, ObservableObject {
                     var existingVideos = self?.videoManager.videos ?? []
                     
                     print("\n☁️ Fetched \(newVideos.count) remote videos:")
-                    newVideos.forEach { video in
-                        print("- \(video.displayTitle) (\(video.geozone))")
-                        print("  Remote URL: \(video.remoteVideoURL)")
-                        print("  Thumbnail URL: \(video.remoteThumbnailURL)")
-                    }
-                    
                     for remoteVideo in newVideos {
                         if let existingIndex = existingVideos.firstIndex(where: { $0.id == remoteVideo.id }) {
+                            // Preserve local paths and selection state
+                            var updatedVideo = remoteVideo
+                            updatedVideo.localVideoPath = existingVideos[existingIndex].localVideoPath
+                            updatedVideo.localThumbnailPath = existingVideos[existingIndex].localThumbnailPath
+                            updatedVideo.isSelected = existingVideos[existingIndex].isSelected
+                            
                             // Update existing video
-                            existingVideos[existingIndex].localVideoPath = nil  // Reset local path if not found
-                            print("📝 Updated existing video: \(remoteVideo.displayTitle)")
-                        } else {
+                            existingVideos[existingIndex] = updatedVideo
+                            print("📝 Updated existing video: \(updatedVideo.displayTitle)")
+                            print("  Preserved local thumbnail: \(updatedVideo.localThumbnailPath ?? "nil")")
+        } else {
                             // Add new video
                             existingVideos.append(remoteVideo)
                             print("➕ Added new video: \(remoteVideo.displayTitle)")
@@ -129,7 +127,7 @@ class VideoPlayerModel: NSObject, ObservableObject {
                     }
                     
                     self?.videoManager.updateVideos(existingVideos)
-                    self?.loadVideos()  // Reload all videos
+                    self?.videos = existingVideos  // Update local reference
                     print("\n✅ Updated video cache with \(newVideos.count) remote videos")
                     
                 case .failure(let error):
@@ -350,7 +348,7 @@ class VideoPlayerModel: NSObject, ObservableObject {
                 
             } catch {
                 print("❌ Failed to save video: \(error.localizedDescription)")
-                completion(false)
+                    completion(false)
             }
         }
         
@@ -363,16 +361,17 @@ class VideoPlayerModel: NSObject, ObservableObject {
         task.resume()
     }
     
-    private func ensureThumbnail(for video: Video) -> URL? {
+    func ensureThumbnail(for video: Video) -> URL? {
         print("\n🖼️ Ensuring thumbnail for: \(video.displayTitle)")
         
         // 1. Check for existing local thumbnail
         if let localPath = video.localThumbnailPath {
-            let thumbnailURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent(localPath)
+            let thumbnailURL = documentsDirectory.appendingPathComponent(localPath)
             if FileManager.default.fileExists(atPath: thumbnailURL.path) {
                 print("✅ Using existing local thumbnail: \(thumbnailURL.path)")
                 return thumbnailURL
+            } else {
+                print("⚠️ Local thumbnail path exists but file is missing: \(thumbnailURL.path)")
             }
         }
         
@@ -380,25 +379,41 @@ class VideoPlayerModel: NSObject, ObservableObject {
         if video.isLocal {
             print("📹 Generating thumbnail from local video: \(video.url.path)")
             if let thumbnailURL = generateThumbnail(from: video.url, videoId: video.id) {
-                let relativePath = "Thumbnails/\(video.id)_thumbnail.jpg"
+                let relativePath = "Thumbnails/\(video.id).jpg"
                 videoManager.updateThumbnailPath(for: video.id, path: relativePath)
                 print("✅ Generated and saved local thumbnail: \(thumbnailURL.path)")
                 return thumbnailURL
+            } else {
+                print("⚠️ Failed to generate thumbnail from local video")
             }
         }
         
         // 3. Download remote thumbnail if available
         if let remoteThumbnailURL = video.remoteThumbnailURL {
             print("☁️ Downloading remote thumbnail: \(remoteThumbnailURL)")
-            downloadThumbnail(from: remoteThumbnailURL) { [weak self] thumbnailURL in
-                if let thumbnailURL = thumbnailURL {
-                    let relativePath = "Thumbnails/\(video.id)_thumbnail.jpg"
-                    self?.videoManager.updateThumbnailPath(for: video.id, path: relativePath)
-                    print("✅ Downloaded and saved remote thumbnail: \(thumbnailURL.path)")
+            
+            // Create expected local path
+            let localThumbnailPath = "Thumbnails/\(video.id).jpg"
+            let localThumbnailURL = documentsDirectory.appendingPathComponent(localThumbnailPath)
+            
+            // Start download if file doesn't exist
+            if !FileManager.default.fileExists(atPath: localThumbnailURL.path) {
+                downloadThumbnail(for: video) { [weak self] success in
+                    if success {
+                        print("✅ Successfully downloaded and saved thumbnail: \(localThumbnailPath)")
+                        self?.objectWillChange.send()  // Force UI refresh
+                    } else {
+                        print("❌ Failed to download thumbnail")
+                    }
                 }
+            } else {
+                print("📍 Thumbnail already exists at: \(localThumbnailURL.path)")
             }
+            
+            return localThumbnailURL
         }
         
+        print("❌ No thumbnail source available for video: \(video.displayTitle)")
         return nil
     }
     
@@ -407,7 +422,8 @@ class VideoPlayerModel: NSObject, ObservableObject {
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         
-        let thumbnailURL = thumbnailsDirectory.appendingPathComponent("\(videoId)_thumbnail.jpg")
+        // Already using the correct format without "_thumbnail"
+        let thumbnailURL = thumbnailsDirectory.appendingPathComponent("\(videoId).jpg")
         
         do {
             let cgImage = try imageGenerator.copyCGImage(at: .zero, actualTime: nil)
@@ -423,26 +439,84 @@ class VideoPlayerModel: NSObject, ObservableObject {
         return nil
     }
     
-    private func downloadThumbnail(from url: URL, completion: @escaping (URL?) -> Void) {
-        let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
-            guard let self = self,
-                  let tempURL = tempURL,
-                  error == nil else {
-                print("❌ Failed to download thumbnail: \(error?.localizedDescription ?? "Unknown error")")
-                completion(nil)
+    private func downloadThumbnail(for video: Video, completion: @escaping (Bool) -> Void) {
+        guard let remoteThumbnailURL = video.remoteThumbnailURL else {
+            print("❌ No remote thumbnail URL available for video: \(video.displayTitle)")
+            completion(false)
+            return
+        }
+        
+        print("\n📥 Starting thumbnail download:")
+        print("Video: \(video.displayTitle)")
+        print("Remote URL: \(remoteThumbnailURL)")
+        
+        // Create signed request for the thumbnail
+        let request = s3VideoService.generateSignedRequest(for: remoteThumbnailURL)
+        
+        let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                print("❌ Thumbnail download failed: \(error.localizedDescription)")
+                completion(false)
                 return
             }
             
-            let thumbnailURL = self.thumbnailsDirectory.appendingPathComponent("\(UUID().uuidString)_thumbnail.jpg")
+            if let httpResponse = response as? HTTPURLResponse {
+                print("📡 Thumbnail response status: \(httpResponse.statusCode)")
+            }
+            
+            guard let tempURL = tempURL,
+                  let response = response as? HTTPURLResponse,
+                  (200...299).contains(response.statusCode) else {
+                print("❌ Invalid thumbnail response or missing file")
+                print("Response: \(String(describing: response))")
+                completion(false)
+                return
+            }
             
             do {
-                try FileManager.default.moveItem(at: tempURL, to: thumbnailURL)
-                completion(thumbnailURL)
+                // Ensure thumbnails directory exists
+                try FileManager.default.createDirectory(at: self.thumbnailsDirectory, 
+                                                     withIntermediateDirectories: true)
+                
+                // Create final thumbnail URL
+                let localThumbnailPath = "Thumbnails/\(video.id).jpg"
+                let finalURL = self.documentsDirectory.appendingPathComponent(localThumbnailPath)
+                
+                print("\n💾 Saving thumbnail:")
+                print("From: \(tempURL.path)")
+                print("To: \(finalURL.path)")
+                
+                // Remove existing file if it exists
+                if FileManager.default.fileExists(atPath: finalURL.path) {
+                    try FileManager.default.removeItem(at: finalURL)
+                    print("🗑️ Removed existing thumbnail")
+                }
+                
+                // Move downloaded file to final location
+                try FileManager.default.moveItem(at: tempURL, to: finalURL)
+            
+            DispatchQueue.main.async {
+                    // Update video model with local thumbnail path
+                    self.videoManager.updateThumbnailPath(for: video.id, path: localThumbnailPath)
+                    print("✅ Successfully saved thumbnail and updated path")
+                    
+                    // Force UI refresh for this video
+                    if let index = self.videos.firstIndex(where: { $0.id == video.id }) {
+                        self.objectWillChange.send()
+                        self.videos[index].localThumbnailPath = localThumbnailPath
+                    }
+                    
+                completion(true)
+                }
             } catch {
                 print("❌ Failed to save thumbnail: \(error)")
-                completion(nil)
+                print("Error details: \(error.localizedDescription)")
+                completion(false)
             }
         }
+        
         task.resume()
     }
     

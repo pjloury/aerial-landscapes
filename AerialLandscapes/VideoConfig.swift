@@ -55,6 +55,12 @@ struct VideoConfig {
             filename: "TestValencia",
             displayTitle: "Old Town Valencia",
             geozone: "international"
+        ),
+        VideoMetadata(
+            uuid: "8ddae2f7-0ae2-4997-a4fc-73590ba1d66f",
+            filename: "8ddae2f7-0ae2-4997-a4fc-73590ba1d66f",
+            displayTitle: "Balearic Islands",
+            geozone: "international"
         )
     ])
 }

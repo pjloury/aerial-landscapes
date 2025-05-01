@@ -51,20 +51,39 @@ struct Video: Identifiable, Codable {
     }
     
     // Update the thumbnail URL logic
-    var thumbnailURL: URL? {  // Make this optional
+    var thumbnailURL: URL? {
+        print("\n🔍 Getting thumbnail URL for video: \(displayTitle)")
+        
         // 1. Check for existing local thumbnail
         if let localPath = localThumbnailPath {
-            return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent(localPath)
+            // Remove any "_thumbnail" suffix if it exists
+            let cleanPath = localPath.replacingOccurrences(of: "_thumbnail.jpg", with: ".jpg")
+            let localURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent(cleanPath)
+            
+            print("📍 Found local thumbnail path: \(localPath)")
+            print("📍 Clean path: \(cleanPath)")
+            print("📍 Full local URL: \(localURL.path)")
+            
+            // Verify file exists
+            if FileManager.default.fileExists(atPath: localURL.path) {
+                print("✅ Local thumbnail file exists")
+                return localURL
+            } else {
+                print("⚠️ Local thumbnail file not found at path")
+            }
+        } else {
+            print("ℹ️ No local thumbnail path set")
         }
         
         // 2. If we have a local video, return nil to trigger placeholder
-        // This will be replaced once the thumbnail is generated
         if isLocal {
+            print("📹 Video is local, returning nil to generate thumbnail")
             return nil
         }
         
         // 3. Fall back to remote thumbnail
+        print("☁️ Using remote thumbnail URL: \(remoteThumbnailURL?.absoluteString ?? "nil")")
         return remoteThumbnailURL
     }
     
@@ -100,6 +119,17 @@ struct Video: Identifiable, Codable {
         )
         
         return video
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case id
+        case displayTitle
+        case geozone
+        case remoteVideoPath
+        case remoteThumbnailPath
+        case localVideoPath
+        case localThumbnailPath
+        case isSelected
     }
 }
 

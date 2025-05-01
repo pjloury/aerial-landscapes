@@ -48,17 +48,22 @@ class S3VideoService: ObservableObject {
         return s3Service.generateSignedRequest(for: remoteURL)
     }
     
+    func generateSignedRequest(for url: URL) -> URLRequest {
+        return s3Service.generateSignedRequest(for: url)
+    }
+    
     func getThumbnailURL(for uuid: String) -> URL? {
-        return s3Service.getThumbnailURL(for: uuid)
+        let urlString = "https://\(s3Service.bucketName).s3.\(s3Service.region).amazonaws.com/\(uuid).jpg"
+        return URL(string: urlString)
     }
 }
 
 // S3Service implementation
 class S3Service {
+    public let bucketName: String
+    public let region: String
     private let accessKey: String
     private let secretKey: String
-    private let region: String
-    private let bucketName: String
     
     init(accessKey: String, secretKey: String, region: String, bucketName: String) {
         self.accessKey = accessKey
@@ -87,10 +92,11 @@ class S3Service {
         request.setValue(amzDate, forHTTPHeaderField: "x-amz-date")
         request.setValue("UNSIGNED-PAYLOAD", forHTTPHeaderField: "x-amz-content-sha256")
         
+        // Include the query parameter in the canonical request
         let canonicalRequest = [
             "GET",
             "/",
-            "",
+            "list-type=2",  // Use ListObjectsV2 API
             "host:\(host)",
             "x-amz-content-sha256:UNSIGNED-PAYLOAD",
             "x-amz-date:\(amzDate)",
@@ -122,6 +128,10 @@ class S3Service {
         """
         
         request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
+        
+        // Add the query parameter to the actual request URL
+        let urlWithQuery = URL(string: "\(endpoint)?list-type=2")!
+        request.url = urlWithQuery
         
         // Log request headers
         print("\n📤 Request Headers:")
@@ -268,7 +278,7 @@ class S3Service {
     }
     
     func getThumbnailURL(for uuid: String) -> URL? {
-        let urlString = "https://\(bucketName).s3.\(region).amazonaws.com/\(uuid)_thumbnail.jpg"
+        let urlString = "https://\(bucketName).s3.\(region).amazonaws.com/\(uuid).jpg"
         return URL(string: urlString)
     }
 }
@@ -279,11 +289,12 @@ private class S3ParserDelegate: NSObject, XMLParserDelegate {
     private let region: String
     var videos: [Video] = []
     
-    // Add currentElement to track XML parsing
     private var currentElement: String = ""
     private var currentKey: String = ""
-    private var currentMetadata: [String: String] = [:]
+    private var currentDisplayTitle: String = ""
+    private var currentGeozone: String = ""
     private var isInMetadata = false
+    private var currentMetadataKey: String = ""
     
     init(bucketName: String, region: String) {
         self.bucketName = bucketName
@@ -292,7 +303,7 @@ private class S3ParserDelegate: NSObject, XMLParserDelegate {
     }
     
     func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
-        print("📎 Parsing element: \(elementName)")
+        print("📎 Starting element: \(elementName)")
         currentElement = elementName
         
         switch elementName {
@@ -300,24 +311,32 @@ private class S3ParserDelegate: NSObject, XMLParserDelegate {
             currentKey = ""
         case "UserMetadata":
             isInMetadata = true
-            currentMetadata = [:]
+            currentDisplayTitle = ""
+            currentGeozone = ""
+        case "x-amz-meta-display-title", "x-amz-meta-geozone":
+            if isInMetadata {
+                currentMetadataKey = elementName
+            }
         default:
             break
         }
     }
     
     func parser(_ parser: XMLParser, foundCharacters string: String) {
-        if currentKey.isEmpty && currentElement == "Key" {
-            currentKey = string
-            print("📄 Found key: \(string)")
+        let trimmedString = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedString.isEmpty else { return }
+        
+        if currentElement == "Key" {
+            currentKey = trimmedString
+            print("📄 Found key: \(trimmedString)")
         } else if isInMetadata {
-            switch currentElement {
+            switch currentMetadataKey {
             case "x-amz-meta-display-title":
-                currentMetadata["display-title"] = string
-                print("📝 Found display title: \(string)")
+                currentDisplayTitle = trimmedString
+                print("📝 Found display title: \(trimmedString)")
             case "x-amz-meta-geozone":
-                currentMetadata["geozone"] = string
-                print("🌍 Found geozone: \(string)")
+                currentGeozone = trimmedString
+                print("🌍 Found geozone: \(trimmedString)")
             default:
                 break
             }
@@ -326,36 +345,40 @@ private class S3ParserDelegate: NSObject, XMLParserDelegate {
     
     func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         if elementName == "Contents" {
-            // Only process video files
-            if currentKey.hasSuffix(".mp4") || currentKey.hasSuffix(".mov"),
-               let displayTitle = currentMetadata["display-title"],
-               let geozone = currentMetadata["geozone"] {
+            if currentKey.hasSuffix(".mp4") || currentKey.hasSuffix(".mov") {
+                let baseFilename = currentKey.components(separatedBy: ".").first ?? currentKey
                 
-                let baseUrl = "https://\(bucketName).s3.\(region).amazonaws.com"
-                let videoUrlString = "\(baseUrl)/\(currentKey)"
-                let thumbnailUrlString = "\(baseUrl)/\(currentKey)_thumbnail.jpg"
+                let remoteThumbnailPath = "\(baseFilename).jpg"
+                let localThumbnailPath = "Thumbnails/\(baseFilename).jpg"
                 
-                // Create Video with all required parameters
+                // Create Video using S3 metadata
                 let video = Video(
-                    id: "remote-\(currentKey.replacingOccurrences(of: ".mp4", with: "").replacingOccurrences(of: ".mov", with: ""))",
-                    displayTitle: displayTitle,
-                    geozone: geozone,
+                    id: baseFilename,
+                    displayTitle: currentDisplayTitle.isEmpty ? baseFilename : currentDisplayTitle,
+                    geozone: currentGeozone.isEmpty ? "international" : currentGeozone,
                     remoteVideoPath: currentKey,
-                    remoteThumbnailPath: "\(currentKey)_thumbnail.jpg",
+                    remoteThumbnailPath: remoteThumbnailPath,
                     localVideoPath: nil,
+                    localThumbnailPath: localThumbnailPath,
                     isSelected: false
                 )
                 videos.append(video)
                 
-                print("📼 Parsed video: \(displayTitle)")
-                print("   Video URL: \(videoUrlString)")
-                print("   Thumbnail URL: \(thumbnailUrlString)")
-                print("   Metadata: \(currentMetadata)")
+                print("📼 Parsed video: \(video.displayTitle)")
+                print("   Video URL: \(video.remoteVideoURL?.absoluteString ?? "nil")")
+                print("   Remote Thumbnail Path: \(remoteThumbnailPath)")
+                print("   Local Thumbnail Path: \(localThumbnailPath)")
+                print("   Geozone: \(video.geozone)")
+                print("   S3 Metadata - Display Title: \(currentDisplayTitle)")
+                print("   S3 Metadata - Geozone: \(currentGeozone)")
             }
             
             // Reset for next item
             currentKey = ""
-            currentMetadata = [:]
+            currentDisplayTitle = ""
+            currentGeozone = ""
+            isInMetadata = false
+            currentMetadataKey = ""
         } else if elementName == "UserMetadata" {
             isInMetadata = false
         }

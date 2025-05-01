@@ -107,34 +107,64 @@ struct VideoItemView: View {
     let isDownloading: Bool
     let action: () -> Void
     
+    // Add state to track loading state
+    @State private var isLoadingThumbnail = false
+    
     var body: some View {
         Button(action: action) {
             VStack(spacing: 12) {
                 // Thumbnail with loading overlay
                 ZStack {
                     AsyncImage(url: video.thumbnailURL) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image
-                                .resizable()
-                                .aspectRatio(16/9, contentMode: .fill)
-                                .clipped()
-                        case .failure:
-                            Rectangle()
-                                .fill(Color.gray.opacity(0.3))
-                                .overlay(
-                                    Image(systemName: "photo.fill")
-                                        .foregroundColor(.gray)
-                                )
-                        case .empty:
-                            ProgressView()
-                        @unknown default:
-                            Rectangle()
-                                .fill(Color.gray.opacity(0.3))
+                        Group {
+                            switch phase {
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .aspectRatio(16/9, contentMode: .fill)
+                                    .clipped()
+                                    .onAppear {
+                                        print("✅ Successfully loaded thumbnail from: \(video.thumbnailURL?.absoluteString ?? "nil")")
+                                    }
+                            case .failure(let error):
+                                Rectangle()
+                                    .fill(Color.gray.opacity(0.3))
+                                    .overlay(
+                                        Image(systemName: "photo.fill")
+                                            .foregroundColor(.gray)
+                                    )
+                                    .onAppear {
+                                        isLoadingThumbnail = false
+                                        print("❌ Failed to load thumbnail: \(error)")
+                                        print("   URL: \(String(describing: video.thumbnailURL))")
+                                        // Retry the thumbnail download if it failed
+                                        if !isLoadingThumbnail {
+                                            isLoadingThumbnail = true
+                                            videoPlayerModel.ensureThumbnail(for: video)
+                                        }
+                                    }
+                            case .empty:
+                                ProgressView()
+                                    .onAppear {
+                                        if !isLoadingThumbnail {
+                                            isLoadingThumbnail = true
+                                            print("⏳ Loading thumbnail for: \(video.displayTitle)")
+                                            print("🔗 Attempting to load URL: \(String(describing: video.thumbnailURL))")
+                                        }
+                                    }
+                            @unknown default:
+                                Rectangle()
+                                    .fill(Color.gray.opacity(0.3))
+                                    .onAppear {
+                                        print("⚠️ Unknown thumbnail loading state for: \(video.displayTitle)")
+                                    }
+                            }
                         }
                     }
                     .aspectRatio(16/9, contentMode: .fit)
                     .cornerRadius(8)
+                    // Add id to force refresh when URL changes
+                    .id(video.thumbnailURL?.absoluteString ?? video.id)
                     
                     // Show download progress overlay
                     if isDownloading {
