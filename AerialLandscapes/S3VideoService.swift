@@ -26,6 +26,9 @@ class S3VideoService: ObservableObject {
     func fetchAvailableVideos(completion: @escaping (VideoFetchResult) -> Void) {
         print("\n=== 📱 Fetching Available S3 Videos ===")
         
+        testS3Access()
+        testS3Connection()
+
         s3Service.listObjects { [weak self] result in
             if let (urls, thumbnails) = result {
                 // Process video files and match with thumbnails
@@ -61,7 +64,7 @@ class S3VideoService: ObservableObject {
                         url: url,
                         title: title,
                         isLocal: false,
-                        thumbnailURL: self?.thumbnailCache.getCachedThumbnailURL(for: title) ?? thumbnailURL,
+                        thumbnailInfo: .remote(thumbnailURL),
                         section: section
                     )
                 }
@@ -77,9 +80,14 @@ class S3VideoService: ObservableObject {
         print("\n📥 Downloading thumbnail for: \(videoTitle)")
         print("URL: \(url)")
         
-        // Check if already cached
+        // Check if already cached and valid
         if let cachedURL = thumbnailCache.getCachedThumbnailURL(for: videoTitle) {
-            print("✅ Already cached at: \(cachedURL)")
+            print("✅ Found valid cached thumbnail at: \(cachedURL)")
+            
+            // Update UI with cached thumbnail
+            DispatchQueue.main.async { [weak self] in
+                self?.updateRemoteVideoThumbnail(for: videoTitle, with: .local(cachedURL))
+            }
             return
         }
         
@@ -92,8 +100,18 @@ class S3VideoService: ObservableObject {
                 return
             }
             
-            guard let imageData = data else {
-                print("❌ No image data received for \(videoTitle)")
+            guard let httpResponse = response as? HTTPURLResponse else {
+                print("❌ Invalid response type for \(videoTitle)")
+                return
+            }
+            
+            guard httpResponse.statusCode == 200 else {
+                print("❌ Invalid response status \(httpResponse.statusCode) for \(videoTitle)")
+                return
+            }
+            
+            guard let imageData = data, imageData.count > 0 else {
+                print("❌ No valid image data received for \(videoTitle)")
                 return
             }
             
@@ -105,26 +123,29 @@ class S3VideoService: ObservableObject {
                 
                 // Update the video item with the cached thumbnail URL
                 DispatchQueue.main.async {
-                    self?.updateRemoteVideoThumbnail(for: videoTitle, with: thumbnailURL)
+                    self?.updateRemoteVideoThumbnail(for: videoTitle, with: .local(thumbnailURL))
                     print("✅ Updated UI with cached thumbnail for \(videoTitle)")
                 }
             } else {
-                print("❌ Failed to cache thumbnail for \(videoTitle)")
+                // If caching fails, fall back to remote URL
+                DispatchQueue.main.async {
+                    self?.updateRemoteVideoThumbnail(for: videoTitle, with: .remote(url))
+                    print("⚠️ Falling back to remote thumbnail for \(videoTitle)")
+                }
             }
         }
         
         task.resume()
     }
     
-    private func updateRemoteVideoThumbnail(for videoTitle: String, with thumbnailURL: URL) {
-        // Find and update the video item with the new thumbnail
+    private func updateRemoteVideoThumbnail(for videoTitle: String, with thumbnailInfo: VideoPlayerModel.VideoItem.ThumbnailInfo) {
         if let index = remoteVideos.firstIndex(where: { $0.title == videoTitle }) {
             let video = remoteVideos[index]
             remoteVideos[index] = VideoPlayerModel.VideoItem(
                 url: video.url,
                 title: video.title,
                 isLocal: video.isLocal,
-                thumbnailURL: thumbnailURL,
+                thumbnailInfo: thumbnailInfo,
                 section: video.section
             )
         }
@@ -228,7 +249,7 @@ class S3VideoService: ObservableObject {
                             print("💾 Cached thumbnail for \(video.title) at \(thumbnailURL.lastPathComponent)")
                             // Update the video item with the new thumbnail URL
                             DispatchQueue.main.async {
-                                self?.updateThumbnail(for: video.title, with: thumbnailURL)
+                                self?.updateThumbnail(for: video.title, with: .local(thumbnailURL))
                                 print("✅ Updated UI with thumbnail for \(video.title)")
                             }
                         } else {
@@ -250,18 +271,16 @@ class S3VideoService: ObservableObject {
         task.resume()
     }
     
-    private func updateThumbnail(for videoTitle: String, with thumbnailURL: URL) {
-        // Find and update the video item with the new thumbnail
+    private func updateThumbnail(for videoTitle: String, with thumbnailInfo: VideoPlayerModel.VideoItem.ThumbnailInfo) {
         if let index = remoteVideos.firstIndex(where: { $0.title == videoTitle }) {
-            var updatedVideo = remoteVideos[index]
-            updatedVideo = VideoPlayerModel.VideoItem(
-                url: updatedVideo.url,
-                title: updatedVideo.title,
-                isLocal: updatedVideo.isLocal,
-                thumbnailURL: thumbnailURL,
-                section: updatedVideo.section
+            let video = remoteVideos[index]
+            remoteVideos[index] = VideoPlayerModel.VideoItem(
+                url: video.url,
+                title: video.title,
+                isLocal: video.isLocal,
+                thumbnailInfo: thumbnailInfo,
+                section: video.section
             )
-            remoteVideos[index] = updatedVideo
         }
     }
     
@@ -336,19 +355,195 @@ class S3VideoService: ObservableObject {
             }
         }.resume()
     }
+
+    func testS3Connection() {
+        print("\n=== 🧪 S3 Connection Test ===")
+        print("Bucket: \(s3Service.bucketName)")
+        print("Region: \(s3Service.region)")
+        
+        let timestamp = s3Service.getCurrentAWSTimestamp()
+        let amzDate = timestamp.amzDate
+        let dateStamp = timestamp.dateStamp
+        
+        let host = "\(s3Service.bucketName).s3.\(s3Service.region).amazonaws.com"
+        let endpoint = "https://\(host)/"
+        
+        print("\nEndpoint: \(endpoint)")
+        print("Date: \(amzDate)")
+        
+        var request = URLRequest(url: URL(string: endpoint)!)
+        request.httpMethod = "GET"
+        request.setValue(host, forHTTPHeaderField: "Host")
+        request.setValue(amzDate, forHTTPHeaderField: "x-amz-date")
+        request.setValue("UNSIGNED-PAYLOAD", forHTTPHeaderField: "x-amz-content-sha256")
+        
+        // Create canonical request and signature
+        let canonicalRequest = [
+            "GET",
+            "/",
+            "",
+            "host:\(host)",
+            "x-amz-content-sha256:UNSIGNED-PAYLOAD",
+            "x-amz-date:\(amzDate)",
+            "",
+            "host;x-amz-content-sha256;x-amz-date",
+            "UNSIGNED-PAYLOAD"
+        ].joined(separator: "\n")
+        
+        let algorithm = "AWS4-HMAC-SHA256"
+        let credentialScope = "\(dateStamp)/\(s3Service.region)/s3/aws4_request"
+        let stringToSign = """
+        \(algorithm)
+        \(amzDate)
+        \(credentialScope)
+        \(sha256(canonicalRequest))
+        """
+        
+        let kDate = hmac(key: "AWS4\(s3Service.secretKey)".data(using: .utf8)!, data: dateStamp)
+        let kRegion = hmac(key: kDate, data: s3Service.region)
+        let kService = hmac(key: kRegion, data: "s3")
+        let kSigning = hmac(key: kService, data: "aws4_request")
+        let signature = hmac(key: kSigning, data: stringToSign).hexEncodedString()
+        
+        let authorizationHeader = """
+        \(algorithm) \
+        Credential=\(s3Service.accessKey)/\(credentialScope), \
+        SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+        Signature=\(signature)
+        """
+        
+        request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
+        
+        print("\nRequest Headers:")
+        request.allHTTPHeaderFields?.forEach { key, value in
+            print("\(key): \(value)")
+        }
+        
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            print("\n=== Response ===")
+            
+            if let error = error {
+                print("❌ Error: \(error.localizedDescription)")
+                return
+            }
+            
+            if let httpResponse = response as? HTTPURLResponse {
+                print("Status Code: \(httpResponse.statusCode)")
+                print("\nResponse Headers:")
+                httpResponse.allHeaderFields.forEach { key, value in
+                    print("\(key): \(value)")
+                }
+            }
+            
+            if let data = data, let xmlString = String(data: data, encoding: .utf8) {
+                print("\nResponse Body:")
+                print(xmlString)
+            } else {
+                print("No data received")
+            }
+        }
+        
+        task.resume()
+    }
+    
+    func getThumbnailURL(for videoTitle: String) -> URL? {
+        // First, encode spaces and special characters
+        let encodedTitle = videoTitle
+            .replacingOccurrences(of: " ", with: "%20")
+            .replacingOccurrences(of: ",", with: "%2C")
+            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? videoTitle
+        
+        let urlString = "https://\(s3Service.bucketName).s3.\(s3Service.region).amazonaws.com/\(encodedTitle)_thumbnail.jpg"
+        print("Generated URL: \(urlString)")
+        return URL(string: urlString)
+    }
     
     func refreshThumbnails(forceRefresh: Bool = false) {
-        print("\n🔄 Refreshing thumbnails...")
+        print("\n=== 🔄 Starting Thumbnail Refresh ===")
         print("Force refresh: \(forceRefresh)")
         
         for video in remoteVideos {
-            if forceRefresh || thumbnailCache.getCachedThumbnailURL(for: video.title) == nil {
-                if let thumbnailURL = video.thumbnailURL {
-                    print("Downloading thumbnail for: \(video.title)")
-                    downloadAndCacheThumbnail(from: thumbnailURL, for: video.title)
+            print("\n🎥 Processing: \(video.title)")
+            print("Current thumbnail URL: \(video.thumbnailInfo.url?.absoluteString ?? "none")")
+            
+            if let cachedURL = thumbnailCache.getCachedThumbnailURL(for: video.title) {
+                print("Found in cache: \(cachedURL)")
+                if !forceRefresh {
+                    print("Skipping refresh - using cached version")
+                    continue
                 }
+            }
+            
+            if let thumbnailURL = video.thumbnailInfo.url {
+                print("Downloading from: \(thumbnailURL)")
+                downloadAndCacheThumbnail(from: thumbnailURL, for: video.title)
             } else {
-                print("Skipping cached thumbnail for: \(video.title)")
+                print("❌ No thumbnail URL available")
+            }
+        }
+    }
+    
+    private func updateRemoteVideoThumbnails(with thumbnails: [String: URL]) {
+        print("\n🔄 Updating remote video thumbnails")
+        print("Received \(thumbnails.count) thumbnail updates")
+        
+        remoteVideos = remoteVideos.map { video -> VideoPlayerModel.VideoItem in
+            if let newThumbnailURL = thumbnails[video.title] ?? thumbnailCache.getCachedThumbnailURL(for: video.title) {
+                print("✅ Updated thumbnail for: \(video.title)")
+                return VideoPlayerModel.VideoItem(
+                    url: video.url,
+                    title: video.title,
+                    isLocal: video.isLocal,
+                    thumbnailInfo: .remote(newThumbnailURL),
+                    section: video.section
+                )
+            }
+            return video
+        }
+    }
+    
+    func refreshThumbnails(forTitles titles: [String]) {
+        print("\n=== 🔄 Refreshing Specific Thumbnails ===")
+        print("Refreshing \(titles.count) thumbnails")
+        
+        for title in titles {
+            print("\n🎥 Processing: \(title)")
+            if let thumbnailURL = getThumbnailURL(for: title) {
+                print("Downloading from: \(thumbnailURL)")
+                
+                // Create a fresh signed request for each thumbnail
+                let request = s3Service.generateSignedRequest(for: thumbnailURL)
+                
+                URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                    guard let self = self else { return }
+                    
+                    if let error = error {
+                        print("❌ Download failed for \(title): \(error.localizedDescription)")
+                        return
+                    }
+                    
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        print("❌ Invalid response type for \(title)")
+                        return
+                    }
+                    
+                    print("\nResponse Status: \(httpResponse.statusCode)")
+                    
+                    if httpResponse.statusCode == 200, let data = data {
+                        print("✅ Received \(data.count / 1024)KB for \(title)")
+                        if let thumbnailURL = self.thumbnailCache.cacheThumbnailData(data, for: title) {
+                            print("💾 Cached thumbnail at: \(thumbnailURL)")
+                            DispatchQueue.main.async {
+                                self.updateRemoteVideoThumbnail(for: title, with: .local(thumbnailURL))
+                            }
+                        }
+                    } else if let errorData = data, let errorString = String(data: errorData, encoding: .utf8) {
+                        print("❌ Error response for \(title):")
+                        print(errorString)
+                    }
+                }.resume()
+            } else {
+                print("❌ Could not generate thumbnail URL for: \(title)")
             }
         }
     }
@@ -360,6 +555,26 @@ struct S3Service {
     let secretKey: String
     let region: String
     let bucketName: String
+    
+    func getCurrentAWSTimestamp() -> (amzDate: String, dateStamp: String) {
+        let currentDate = Date()
+        
+        // Format for x-amz-date: YYYYMMDD'T'HHMMSS'Z'
+        let amzDateFormatter = ISO8601DateFormatter()
+        amzDateFormatter.formatOptions = [.withYear, .withMonth, .withDay, .withTime, .withTimeZone]
+        amzDateFormatter.timeZone = TimeZone(identifier: "UTC")
+        let amzDate = amzDateFormatter.string(from: currentDate)
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: ":", with: "")
+        
+        // Format for DateStamp: YYYYMMDD
+        let dateFormatter = DateFormatter()
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")
+        dateFormatter.dateFormat = "yyyyMMdd"
+        let dateStamp = dateFormatter.string(from: currentDate)
+        
+        return (amzDate, dateStamp)
+    }
     
     func listObjects(completion: @escaping ((urls: [URL], thumbnails: [String: URL])?) -> Void) {
         // Create the exact format AWS expects for x-amz-date
@@ -477,31 +692,38 @@ struct S3Service {
         let dateStamp = dateFormatter.string(from: Date())
         
         // Get the URI-encoded path component
-        let encodedPath = url.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? url.path
+        let path = url.path
+        let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
         
-        // Task 1: Create canonical request with Range header
+        // Create canonical headers (note the ordering is important)
+        let canonicalHeaders = [
+            "host:\(host)",
+            "x-amz-content-sha256:UNSIGNED-PAYLOAD",
+            "x-amz-date:\(amzDate)"
+        ].sorted().joined(separator: "\n") + "\n"
+        
+        // Create signed headers (must be sorted)
+        let signedHeaders = "host;x-amz-content-sha256;x-amz-date"
+        
+        // Task 1: Create canonical request
         let canonicalRequest = [
             "GET",
-            encodedPath, // Use the encoded path here
-            "",
-            "host:\(host)",
-            "range:bytes=0-2097152",
-            "x-amz-content-sha256:UNSIGNED-PAYLOAD",
-            "x-amz-date:\(amzDate)",
-            "",
-            "host;range;x-amz-content-sha256;x-amz-date",
+            encodedPath,
+            "", // Query string (empty in this case)
+            canonicalHeaders,
+            signedHeaders,
             "UNSIGNED-PAYLOAD"
         ].joined(separator: "\n")
         
         // Task 2: Create string to sign
         let algorithm = "AWS4-HMAC-SHA256"
         let credentialScope = "\(dateStamp)/\(region)/s3/aws4_request"
-        let stringToSign = """
-        \(algorithm)
-        \(amzDate)
-        \(credentialScope)
-        \(sha256(canonicalRequest))
-        """
+        let stringToSign = [
+            algorithm,
+            amzDate,
+            credentialScope,
+            sha256(canonicalRequest)
+        ].joined(separator: "\n")
         
         // Task 3: Calculate signature
         let kDate = hmac(key: "AWS4\(secretKey)".data(using: .utf8)!, data: dateStamp)
@@ -510,21 +732,26 @@ struct S3Service {
         let kSigning = hmac(key: kService, data: "aws4_request")
         let signature = hmac(key: kSigning, data: stringToSign).hexEncodedString()
         
-        // Task 4: Create authorization header
-        let authorizationHeader = """
-        \(algorithm) \
-        Credential=\(accessKey)/\(credentialScope), \
-        SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
-        Signature=\(signature)
-        """
+        // Task 4: Create authorization header (note the exact spacing and format)
+        let authorizationHeader = "\(algorithm) " +
+            "Credential=\(accessKey)/\(credentialScope)," +
+            "SignedHeaders=\(signedHeaders)," +
+            "Signature=\(signature)"
         
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue(host, forHTTPHeaderField: "Host")
-        request.setValue("bytes=0-2097152", forHTTPHeaderField: "Range")
         request.setValue(amzDate, forHTTPHeaderField: "x-amz-date")
         request.setValue("UNSIGNED-PAYLOAD", forHTTPHeaderField: "x-amz-content-sha256")
         request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
+        
+        // Add debug logging
+        print("\nRequest URL: \(url)")
+        print("Authorization: \(authorizationHeader)")
+        print("\nHeaders:")
+        request.allHTTPHeaderFields?.forEach { key, value in
+            print("\(key): \(value)")
+        }
         
         return request
     }
@@ -607,50 +834,61 @@ private class ThumbnailCache {
     
     init() {
         let baseCache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        cacheDirectory = baseCache.appendingPathComponent("VideoThumbnails")
+        cacheDirectory = baseCache.appendingPathComponent("VideoThumbnails", isDirectory: true)
         try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
     }
     
     func getCachedThumbnailURL(for videoTitle: String) -> URL? {
-        let thumbnailURL = cacheDirectory.appendingPathComponent("\(videoTitle)_thumbnail.jpg")
-        return FileManager.default.fileExists(atPath: thumbnailURL.path) ? thumbnailURL : nil
-    }
-    
-    func cacheThumbnail(_ cgImage: CGImage, for videoTitle: String) -> URL? {
-        let thumbnailURL = cacheDirectory.appendingPathComponent("\(videoTitle)_thumbnail.jpg")
+        // Sanitize the filename to handle special characters
+        let sanitizedTitle = videoTitle
+            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? videoTitle
+        let thumbnailURL = cacheDirectory.appendingPathComponent("\(sanitizedTitle)_thumbnail.jpg")
         
-        #if os(tvOS)
-        let image = UIImage(cgImage: cgImage)
-        #else
-        let image = NSImage(cgImage: cgImage, size: .zero)
-        #endif
-        
-        #if os(tvOS)
-        if let data = image.jpegData(compressionQuality: 0.8) {
-            try? data.write(to: thumbnailURL)
+        // Verify file exists and is readable
+        if FileManager.default.fileExists(atPath: thumbnailURL.path),
+           let attributes = try? FileManager.default.attributesOfItem(atPath: thumbnailURL.path),
+           (attributes[.size] as? Int64 ?? 0) > 0 {
             return thumbnailURL
         }
-        #else
-        if let data = image.tiffRepresentation,
-           let bitmap = NSBitmapImageRep(data: data),
-           let jpegData = bitmap.representation(using: .jpeg, properties: [:]) {
-            try? jpegData.write(to: thumbnailURL)
-            return thumbnailURL
-        }
-        #endif
-        
         return nil
     }
     
     func cacheThumbnailData(_ data: Data, for videoTitle: String) -> URL? {
-        let thumbnailURL = cacheDirectory.appendingPathComponent("\(videoTitle)_thumbnail.jpg")
+        // Sanitize the filename to handle special characters
+        let sanitizedTitle = videoTitle
+            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? videoTitle
+        let thumbnailURL = cacheDirectory.appendingPathComponent("\(sanitizedTitle)_thumbnail.jpg")
+        
         do {
+            // Create intermediate directories if needed
+            try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+            
+            // Write the data
             try data.write(to: thumbnailURL)
-            return thumbnailURL
+            
+            // Verify the file was written successfully
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: thumbnailURL.path),
+               (attributes[.size] as? Int64 ?? 0) > 0 {
+                return thumbnailURL
+            }
         } catch {
-            print("❌ Failed to write thumbnail data: \(error)")
+            print("❌ Failed to write thumbnail data for \(videoTitle): \(error)")
+        }
+        return nil
+    }
+    
+    func cacheThumbnail(_ cgImage: CGImage, for videoTitle: String) -> URL? {
+        // Convert CGImage to UIImage
+        let uiImage = UIImage(cgImage: cgImage)
+        
+        // Convert to JPEG data with high quality
+        guard let imageData = uiImage.jpegData(compressionQuality: 0.9) else {
+            print("❌ Failed to convert image to JPEG data for \(videoTitle)")
             return nil
         }
+        
+        // Use existing method to cache the data
+        return cacheThumbnailData(imageData, for: videoTitle)
     }
 }
 

@@ -123,16 +123,14 @@ struct MoreVideosView: View {
                 UserDefaults.standard.set(Array(selectedVideoIds), forKey: "selectedVideoIds")
             }
             
+            // Update the video player with the selected videos
+            let selectedVideos = allVideos.filter { selectedVideoIds.contains($0.id) }
+            videoPlayerModel.updateSelectedVideos(selectedVideos)
+            
             // Set initial focus
             if let firstVideo = allVideos.first {
                 focusedVideoId = firstVideo.id
             }
-            
-            // Debug current thumbnail state
-            videoPlayerModel.debugThumbnails()
-            
-            // Force refresh thumbnails if any are missing
-            videoPlayerModel.s3VideoService.refreshThumbnails(forceRefresh: true)
         }
         .alert("Clear Cache?", isPresented: $showingClearCacheAlert) {
             Button("Cancel", role: .cancel) { }
@@ -239,36 +237,22 @@ struct VideoItemView: View {
             VStack(spacing: 12) {
                 // Thumbnail with loading overlay
                 ZStack {
-                    // Always show thumbnail if available
-                    if let thumbnailURL = video.thumbnailURL {
-                        AsyncImage(url: thumbnailURL) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image
-                                    .resizable()
-                                    .aspectRatio(16/9, contentMode: .fill)
-                            case .failure(_):
-                                Rectangle()
-                                    .fill(Color.gray.opacity(0.3))
-                                    .overlay(
-                                        Image(systemName: "photo.fill")
-                                            .foregroundColor(.gray)
-                                    )
-                            case .empty:
-                                Rectangle()
-                                    .fill(Color.gray.opacity(0.3))
-                                    .overlay(
-                                        ProgressView()
-                                            .tint(.white)
-                                    )
-                            @unknown default:
-                                Rectangle()
-                                    .fill(Color.gray.opacity(0.3))
-                            }
+                    switch video.thumbnailInfo {
+                    case .local(let url):
+                        AsyncImage(url: url) { phase in
+                            handleImagePhase(phase)
                         }
                         .aspectRatio(16/9, contentMode: .fit)
                         .cornerRadius(8)
-                    } else {
+                        
+                    case .remote(let url):
+                        AsyncImage(url: url) { phase in
+                            handleImagePhase(phase)
+                        }
+                        .aspectRatio(16/9, contentMode: .fit)
+                        .cornerRadius(8)
+                        
+                    case .notAvailable:
                         Rectangle()
                             .fill(Color.gray.opacity(0.3))
                             .aspectRatio(16/9, contentMode: .fit)
@@ -347,6 +331,41 @@ struct VideoItemView: View {
         }
         .buttonStyle(.card)
         .disabled(isDownloading)
+    }
+    
+    private func handleImagePhase(_ phase: AsyncImagePhase) -> some View {
+        switch phase {
+        case .success(let image):
+            return AnyView(
+                image
+                    .resizable()
+                    .aspectRatio(16/9, contentMode: .fill)
+                    .clipped()
+            )
+        case .failure:
+            return AnyView(
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+                    .overlay(
+                        Image(systemName: "photo.fill")
+                            .foregroundColor(.gray)
+                    )
+            )
+        case .empty:
+            return AnyView(
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+                    .overlay(
+                        ProgressView()
+                            .tint(.white)
+                    )
+            )
+        @unknown default:
+            return AnyView(
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+            )
+        }
     }
 }
 

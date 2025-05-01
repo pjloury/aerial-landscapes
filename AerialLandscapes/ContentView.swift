@@ -44,7 +44,7 @@ struct NowPlayingView: View {
                 .edgesIgnoringSafeArea(.all)
             
             // Show message when no videos are selected
-            if videoPlayerModel.currentPlaylist.isEmpty {
+            if videoPlayerModel.selectedPlaylist.isEmpty {
                 Text("Head to More Videos to get started")
                     .font(.system(size: 30, weight: .medium))
                     .foregroundColor(.white)
@@ -52,7 +52,7 @@ struct NowPlayingView: View {
             }
             
             // Title overlay (only show when video is playing)
-            if !videoPlayerModel.currentPlaylist.isEmpty {
+            if !videoPlayerModel.selectedPlaylist.isEmpty {
                 VStack {
                     Spacer()
                     HStack {
@@ -90,4 +90,5 @@ struct VideoPlayerView: UIViewControllerRepresentable {
 
 #Preview {
     ContentView()
+        .preferredColorScheme(.light)
 }
