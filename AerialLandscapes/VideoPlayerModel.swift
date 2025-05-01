@@ -1,37 +1,32 @@
 import Foundation
 import AVKit
-
-private struct BundledVideo {
-    let filename: String
-    let title: String
-    let section: String
-}
+import AVFoundation
+import SwiftUI
 
 class VideoPlayerModel: NSObject, ObservableObject {
     @Published var currentVideoTitle: String = ""
     let player: AVQueuePlayer
-    @Published var videos: [VideoItem] = []  // Local videos only
-    @Published private(set) var selectedPlaylist: [VideoItem] = []  // Rename from currentPlaylist
-    private let selectedVideoIdsKey = "selectedVideoIds"
+    @Published private(set) var videos: [Video] = []
     
-    // Add a property to track download progress
-    @Published var downloadProgress: [String: Double] = [:]
+    // Track currently playing index
+    private var currentPlaylistIndex: Int = 0
     
-    // Add a property to track downloaded video info
-    private let downloadedVideosKey = "downloadedVideos"
+    // Add a property to track the current playlist order
+    private var currentPlaylist: [Video] = []
     
-    // Add property to store observation
-    private var progressObservation: NSKeyValueObservation?
+    // Get selected videos in a computed property
+    var selectedVideos: [Video] {
+        return videos.filter { $0.isLocal && $0.isSelected }
+    }
     
     // Add S3 service
     let s3VideoService = S3VideoService()
     
-    // Add new properties
-    private let cacheManager = VideoCacheManager()
     @Published private(set) var isInitialLoad = true
     
-    // Modify remoteVideos to be a published property
-    @Published private(set) var remoteVideos: [VideoItem] = []
+    @Published private(set) var remoteVideos: [Video] = []
+    
+    @Published var downloadProgress: [String: Double] = [:]
     
     private var documentsDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -43,187 +38,109 @@ class VideoPlayerModel: NSObject, ObservableObject {
         return directory
     }
     
-    private let bundledVideos: [BundledVideo] = [
-        // California Videos
-        BundledVideo(filename: "Fort Funston", title: "Fort Funston", section: "California"),
-        BundledVideo(filename: "Waves", title: "Waves", section: "California"),
-        BundledVideo(filename: "Stanford Main Quad", title: "Stanford Main Quad", section: "California"),
-        BundledVideo(filename: "Sather Tower", title: "Sather Tower", section: "California"),
-        BundledVideo(filename: "Salt Flats", title: "Salt Flats", section: "California"),
-        
-        // International Videos
-        BundledVideo(filename: "TestAlps", title: "Test Alps", section: "International"),
-        BundledVideo(filename: "TestHvar", title: "Test Hvar", section: "International"),
-        BundledVideo(filename: "TestCopa", title: "Test Copa", section: "International"),
-        BundledVideo(filename: "TestValencia", title: "Test Valencia", section: "International")
-    ]
-    
-    struct VideoItem: Identifiable {
-        let id: String
-        let url: URL
-        let title: String
-        let isLocal: Bool
-        let thumbnailInfo: ThumbnailInfo
-        let section: String
-        
-        enum ThumbnailInfo {
-            case local(URL)      // Local cached file URL
-            case remote(URL)     // S3 URL
-            case notAvailable    // No thumbnail available
-            
-            var url: URL? {
-                switch self {
-                case .local(let url), .remote(let url):
-                    return url
-                case .notAvailable:
-                    return nil
-                }
-            }
-            
-            var isLocal: Bool {
-                if case .local = self {
-                    return true
-                }
-                return false
-            }
-        }
-        
-        var displayTitle: String {
-            isLocal ? title : "\(title) (Remote)"
-        }
-        
-        init(url: URL, title: String, isLocal: Bool, thumbnailInfo: ThumbnailInfo, section: String) {
-            self.id = isLocal ? "local-\(title)" : "remote-\(title)"
-            self.url = url
-            self.title = title
-            self.isLocal = isLocal
-            self.thumbnailInfo = thumbnailInfo
-            self.section = section
-        }
+    private var thumbnailsDirectory: URL {
+        let directory = documentsDirectory.appendingPathComponent("Thumbnails")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
     }
+    
+    private var videoConfig: VideoConfig {
+        return VideoConfig.shared
+    }
+    
+    private let videoManager = VideoManager.shared
     
     override init() {
         self.player = AVQueuePlayer()
         super.init()
         
-        // Load UI immediately
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            
-            // Load initial state (this loads bundled videos)
-            self.loadInitialState()
-            
-            // Select all bundled videos by default
-            let bundledVideoIds = Set(self.bundledVideos.map { "local-\($0.title)" })
-            UserDefaults.standard.set(Array(bundledVideoIds), forKey: self.selectedVideoIdsKey)
-            
-            // Get the actual bundled video items
-            let bundledVideoItems = self.videos.filter { video in
-                bundledVideoIds.contains(video.id)
-            }
-            
-            // Start playing bundled videos
-            self.updatePlaylist(bundledVideoItems)
-        }
-    }
-    
-    private func loadInitialState() {
-        print("\n=== 📱 Loading Initial State ===")
+        // Set up observers
+        setupPlayerObserver()
+        addPlayerObserver()
         
-        // Step 1: Load bundled and downloaded videos first
-        loadBundledVideos()
-        loadDownloadedVideos()
-        
-        // Step 2: Load and validate cached metadata
-        print("\n=== 📦 Loading Cached Metadata ===")
-        let cachedMetadata = cacheManager.loadVideoMetadata()
-        print("Found \(cachedMetadata.count) cached video entries")
-        
-        // Track corrupted/missing thumbnails for later refresh
-        var corruptedThumbnails: Set<String> = []
-        
-        // Step 3: Process cached metadata and validate thumbnails
-        let cachedVideos = cachedMetadata.compactMap { metadata -> VideoItem? in
-            print("\n🎥 Processing cached video: \(metadata.title)")
+        // Initialize VideoManager with default videos if empty
+        if videoManager.videos.isEmpty {
+            let defaultVideos = videoConfig.videos.map(Video.fromMetadata)
+            videoManager.updateVideos(defaultVideos)
             
-            // Check if this video is already downloaded locally
-            if videos.contains(where: { $0.title == metadata.title }) {
-                print("⏩ Skipping - already in local videos")
-                return nil
-            }
-            
-            // Check thumbnail status
-            let thumbnailStatus = validateThumbnail(for: metadata.title)
-            switch thumbnailStatus {
-            case .valid(let url):
-                print("✅ Valid thumbnail found in cache")
-                return VideoItem(
-                    url: metadata.remoteURL,
-                    title: metadata.title,
-                    isLocal: false,
-                    thumbnailInfo: .remote(url),
-                    section: metadata.section
-                )
-            case .corrupted, .missing:
-                print("⚠️ Thumbnail needs refresh")
-                corruptedThumbnails.insert(metadata.title)
-                // Still create the video item with S3 URL
-                if let thumbnailURL = self.s3VideoService.getThumbnailURL(for: metadata.title) {
-                    return VideoItem(
-                        url: metadata.remoteURL,
-                        title: metadata.title,
-                        isLocal: false,
-                        thumbnailInfo: .remote(thumbnailURL),
-                        section: metadata.section
-                    )
-                } else {
-                    return VideoItem(
-                        url: metadata.remoteURL,
-                        title: metadata.title,
-                        isLocal: false,
-                        thumbnailInfo: .notAvailable,
-                        section: metadata.section
-                    )
+            // First launch - select all local videos by default
+            defaultVideos.forEach { video in
+                if video.isLocal {
+                    videoManager.updateSelection(for: video.id, isSelected: true)
                 }
             }
         }
         
-        // Step 4: Update UI with cached data first
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.remoteVideos = cachedVideos
-            print("\n📱 Updated UI with \(cachedVideos.count) cached remote videos")
-            
-            // Immediately start downloading corrupted/missing thumbnails
-            if !corruptedThumbnails.isEmpty {
-                print("\n🔄 Refreshing \(corruptedThumbnails.count) corrupted/missing thumbnails")
-                self.s3VideoService.refreshThumbnails(forTitles: Array(corruptedThumbnails))
-            }
+        // Load initial state
+        loadVideos()
+        
+        // Start fetching remote videos after initial setup
+        fetchRemoteVideos()
+    }
+    
+    private func loadVideos() {
+        // Get videos from VideoManager (single source of truth)
+        videos = videoManager.videos
+        
+        // Ensure thumbnails for all videos
+        videos.forEach { video in
+            _ = ensureThumbnail(for: video)
         }
         
-        // Step 5: Fetch fresh data from S3
-        print("\n☁️ Fetching fresh data from S3")
+        // Debug logging
+        print("\n📱 Loaded \(videos.count) videos:")
+        print("Selected videos: \(selectedVideos.map(\.displayTitle).joined(separator: ", "))")
+        videos.forEach { video in
+            print("- \(video.displayTitle) (\(video.geozone)) [Selected: \(video.isSelected)]")
+            print("  Local URL: \(video.isLocal ? video.url.path : "Not downloaded")")
+        }
+        
+        // Update player with currently selected videos
+        DispatchQueue.main.async {
+            self.updateSelectedVideos(self.videos)
+        }
+    }
+    
+    private func fetchRemoteVideos() {
         s3VideoService.fetchAvailableVideos { [weak self] result in
-            guard let self = self else { return }
-            
-            switch result {
-            case .success(let freshVideos):
-                print("Found \(freshVideos.count) videos in S3")
-                
-                // Process fresh videos
-                DispatchQueue.main.async {
-                    self.processFreshVideos(freshVideos, existingCache: Set(cachedMetadata.map { $0.title }))
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let newVideos):
+                    // Update or add new videos to VideoManager
+                    var existingVideos = self?.videoManager.videos ?? []
+                    
+                    print("\n☁️ Fetched \(newVideos.count) remote videos:")
+                    newVideos.forEach { video in
+                        print("- \(video.displayTitle) (\(video.geozone))")
+                        print("  Remote URL: \(video.remoteVideoURL)")
+                        print("  Thumbnail URL: \(video.remoteThumbnailURL)")
+                    }
+                    
+                    for remoteVideo in newVideos {
+                        if let existingIndex = existingVideos.firstIndex(where: { $0.id == remoteVideo.id }) {
+                            // Update existing video
+                            existingVideos[existingIndex].localVideoPath = nil  // Reset local path if not found
+                            print("📝 Updated existing video: \(remoteVideo.displayTitle)")
+                        } else {
+                            // Add new video
+                            existingVideos.append(remoteVideo)
+                            print("➕ Added new video: \(remoteVideo.displayTitle)")
+                        }
+                    }
+                    
+                    self?.videoManager.updateVideos(existingVideos)
+                    self?.loadVideos()  // Reload all videos
+                    print("\n✅ Updated video cache with \(newVideos.count) remote videos")
+                    
+                case .failure(let error):
+                    print("❌ Error fetching remote videos: \(error)")
                 }
-                
-            case .failure(let error):
-                print("❌ Failed to fetch fresh data: \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    self.isInitialLoad = false
-                }
+                self?.isInitialLoad = false
             }
         }
     }
     
+    // Setup player observer for end of video
     private func setupPlayerObserver() {
         NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
@@ -234,228 +151,101 @@ class VideoPlayerModel: NSObject, ObservableObject {
                   let finishedItem = notification.object as? AVPlayerItem else { return }
             
             print("\n🔄 Video finished playing")
-            print("Selected playlist count: \(self.selectedPlaylist.count)")
             
-            if self.selectedPlaylist.count == 1 {
-                // Single video - seek back to start
-                print("Single video mode - rewinding to start")
-                finishedItem.seek(to: .zero) { [weak self] finished in
-                    if finished {
-                        print("✅ Seek completed - restarting playback")
-                        self?.player.play()
-                    }
-                }
-            } else {
-                // Multiple videos - handle playlist rotation
-                print("Multiple video mode - rotating playlist")
-                
-                if let urlAsset = finishedItem.asset as? AVURLAsset {
-                    // Find the video that just finished
-                    if let finishedVideo = self.selectedPlaylist.first(where: { $0.url == urlAsset.url }) {
-                        print("Finished playing: \(finishedVideo.title)")
-                        
-                        // Remove the finished item and add it back to the end
-                        self.player.remove(finishedItem)
-                        
-                        // Create a new item for the same video
-                        let newItem = AVPlayerItem(url: finishedVideo.url)
-                        
-                        // Add it to the end of the queue
-                        self.player.insert(newItem, after: self.player.items().last)
-                        print("Re-added \(finishedVideo.title) to queue")
-                    }
-                }
-                
-                // Update the current video title
-                if let currentItem = self.player.currentItem,
-                   let urlAsset = currentItem.asset as? AVURLAsset,
-                   let currentVideo = self.selectedPlaylist.first(where: { $0.url == urlAsset.url }) {
-                    self.currentVideoTitle = currentVideo.title
-                    print("Now playing: \(currentVideo.title)")
-                }
-            }
+            guard !currentPlaylist.isEmpty else { return }
+            
+            // Remove the finished item
+            self.player.remove(finishedItem)
+            
+            // Increment index and wrap around if needed
+            currentPlaylistIndex = (currentPlaylistIndex + 1) % currentPlaylist.count
+            
+            // Get the next video from our stored playlist order
+            let nextVideo = currentPlaylist[currentPlaylistIndex]
+            
+            // Create new player item and add to queue
+            let playerItem = AVPlayerItem(url: nextVideo.url)
+            self.player.insert(playerItem, after: self.player.items().last)
+            addPlayerItemObserver(playerItem, title: nextVideo.displayTitle)
             
             // Ensure playback continues
             self.player.play()
-        }
-    }
-    
-    private func loadBundledVideos() {
-        if let resourcePath = Bundle.main.resourcePath {
-            for bundledVideo in bundledVideos {
-                // Check if the video file exists
-                if let url = Bundle.main.url(forResource: bundledVideo.filename, withExtension: "mov") ??
-                           Bundle.main.url(forResource: bundledVideo.filename, withExtension: "mp4") {
-                    print("Found video: \(bundledVideo.filename)")
-                    
-                    // Generate thumbnail
-                    let thumbnailURL = generateThumbnail(for: url, title: bundledVideo.title)
-                    
-                    let thumbnailInfo: VideoItem.ThumbnailInfo
-                    if let url = thumbnailURL {
-                        thumbnailInfo = .local(url)
-                    } else {
-                        thumbnailInfo = .notAvailable
-                    }
-                    
-                    let video = VideoItem(
-                        url: url,
-                        title: bundledVideo.title,
-                        isLocal: true,
-                        thumbnailInfo: thumbnailInfo,
-                        section: bundledVideo.section
-                    )
-                    videos.append(video)
+            
+            // Update title after ensuring the player has started playing the next item
+            DispatchQueue.main.async {
+                if let currentItem = self.player.currentItem,
+                   let currentVideo = self.getVideo(from: currentItem) {
+                    self.currentVideoTitle = currentVideo.displayTitle
+                    print("▶️ Now playing: \(currentVideo.displayTitle)")
+                    print("Queue position: \(self.currentPlaylistIndex + 1) of \(self.currentPlaylist.count)")
                 }
             }
         }
-    }
-    
-    private func loadDownloadedVideos() {
-        print("\n=== 📚 Loading Downloaded Videos ===")
-        if let downloadedInfo = UserDefaults.standard.dictionary(forKey: downloadedVideosKey) as? [String: String] {
-            print("Found \(downloadedInfo.count) previously downloaded videos")
+        
+        // Add observer for when the current item changes
+        NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemTimeJumped,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  let currentItem = self.player.currentItem,
+                  let currentVideo = self.getVideo(from: currentItem) else { return }
             
-            for (title, filename) in downloadedInfo {
-                print("\n🎥 Processing: \(title)")
-                let videoURL = videosDirectory.appendingPathComponent(filename)
-                
-                if FileManager.default.fileExists(atPath: videoURL.path) {
-                    print("✅ Video file exists at: \(videoURL.path)")
-                    
-                    // Validate the video file
-                    if validateVideoFile(at: videoURL) {
-                        print("✅ Video file is valid")
-                        
-                        // Get or generate thumbnail
-                        let thumbnailURL = thumbnailCacheCheck(for: title) ?? generateThumbnail(for: videoURL, title: title)
-                        
-                        // Determine section (default to California if not found in remote videos)
-                        let section = remoteVideos.first { $0.title == title }?.section ?? "California"
-                        
-                        let thumbnailInfo: VideoItem.ThumbnailInfo
-                        if let cachedThumbnailURL = thumbnailCacheCheck(for: title) {
-                            thumbnailInfo = .local(cachedThumbnailURL)
-                        } else if let s3URL = s3VideoService.getThumbnailURL(for: title) {
-                            thumbnailInfo = .remote(s3URL)
-                        } else {
-                            thumbnailInfo = .notAvailable
-                        }
-                        
-                        let video = VideoItem(
-                            url: videoURL,
-                            title: title,
-                            isLocal: true,
-                            thumbnailInfo: thumbnailInfo,
-                            section: section
-                        )
-                        videos.append(video)
-                        print("✅ Added video to library")
-                    } else {
-                        print("❌ Video file is invalid or corrupted")
-                        // Remove invalid entry
-                        removeDownloadedVideo(title: title, filename: filename)
-                    }
-                } else {
-                    print("❌ Video file missing: \(filename)")
-                    // Remove missing entry
-                    removeDownloadedVideo(title: title, filename: filename)
-                }
-            }
-        }
-        print("\n📊 Loaded \(videos.count) local videos")
-    }
-    
-    private func removeDownloadedVideo(title: String, filename: String) {
-        print("🗑️ Removing downloaded video entry: \(title)")
-        
-        // Remove from UserDefaults
-        if var downloadedInfo = UserDefaults.standard.dictionary(forKey: downloadedVideosKey) as? [String: String] {
-            downloadedInfo.removeValue(forKey: title)
-            UserDefaults.standard.set(downloadedInfo, forKey: downloadedVideosKey)
-        }
-        
-        // Try to remove the file if it exists
-        let videoURL = videosDirectory.appendingPathComponent(filename)
-        try? FileManager.default.removeItem(at: videoURL)
-        
-        // Remove thumbnail if it exists
-        if let thumbnailURL = thumbnailCacheCheck(for: title) {
-            try? FileManager.default.removeItem(at: thumbnailURL)
+            self.currentVideoTitle = currentVideo.displayTitle
+            print("🎵 Current item changed to: \(currentVideo.displayTitle)")
         }
     }
     
-    private func generateThumbnail(for videoURL: URL, title: String) -> URL? {
-        print("Starting thumbnail generation for: \(title)")
-        print("Video URL: \(videoURL)")
+    func updateSelectedVideos(_ videos: [Video]) {
+        print("\n🎬 Updating playlist")
         
-        let asset = AVURLAsset(url: videoURL)
-        let imageGenerator = AVAssetImageGenerator(asset: asset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.maximumSize = CGSize(width: 1920, height: 1080)
-        
-        let time = title.contains("Test") ? 
-            CMTime(seconds: 5, preferredTimescale: 600) :
-            CMTime(seconds: 1, preferredTimescale: 600)
-        
-        do {
-            let cgImage = try imageGenerator.copyCGImage(at: time, actualTime: nil)
-            let uiImage = UIImage(cgImage: cgImage)
-            let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            
-            // Sanitize the filename to handle special characters
-            let sanitizedTitle = title
-                .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? title
-            let thumbnailURL = cacheDirectory.appendingPathComponent("\(sanitizedTitle)_thumbnail.jpg")
-            
-            if let imageData = uiImage.jpegData(compressionQuality: 0.9) {
-                try? imageData.write(to: thumbnailURL)
-                print("✅ Successfully generated and saved thumbnail for: \(title)")
-                print("Path: \(thumbnailURL.path)")
-                return thumbnailURL
-            }
-        } catch {
-            print("❌ Failed to generate thumbnail for \(title)")
-            print("Error: \(error.localizedDescription)")
-        }
-        
-        return nil
-    }
-    
-    private func updatePlaylist(_ localVideos: [VideoItem]) {
-        print("\n🔄 Updating Player Playlist")
-        print("Videos to play: \(localVideos.count)")
-        
-        guard !localVideos.isEmpty else {
-            print("❌ No valid local videos to play")
+        let selectedVideos = self.selectedVideos
+        guard !selectedVideos.isEmpty else {
+            print("❌ No videos selected")
             player.removeAllItems()
-            selectedPlaylist = []  // Update the renamed property
             currentVideoTitle = ""
+            currentPlaylistIndex = 0
+            currentPlaylist = []
             return
         }
         
-        // Shuffle the videos and store them
-        selectedPlaylist = localVideos.shuffled()  // Update the renamed property
-        
-        // Clear existing queue but don't pause
+        // Clear existing queue and reset index
         player.removeAllItems()
+        currentPlaylistIndex = 0
         
-        // Create player items for all videos
-        for video in selectedPlaylist {  // Use renamed property
+        // Shuffle the selected videos for variety
+        let shuffledVideos = selectedVideos.shuffled()
+        // Store the shuffled order
+        currentPlaylist = shuffledVideos
+        
+        print("📋 Adding \(shuffledVideos.count) videos to queue:")
+        print("Playlist order:")
+        shuffledVideos.enumerated().forEach { index, video in
+            print("\(index + 1). \(video.displayTitle)")
+        }
+        
+        // Add all selected videos to queue
+        for video in shuffledVideos {
+            print("➕ Adding to queue: \(video.displayTitle)")
             let playerItem = AVPlayerItem(url: video.url)
             player.insert(playerItem, after: player.items().last)
-            print("Added to queue: \(video.title)")
+            addPlayerItemObserver(playerItem, title: video.displayTitle)
         }
         
-        // Set initial title
-        if let firstVideo = selectedPlaylist.first {  // Use renamed property
-            currentVideoTitle = firstVideo.title
-            print("Starting playback with: \(firstVideo.title)")
-        }
-        
-        // Start playback if not already playing
-        if player.timeControlStatus != .playing {
-            player.play()
+        // Set initial title and start playback
+        if let firstVideo = shuffledVideos.first {
+            // Update title immediately before starting playback
+            currentVideoTitle = firstVideo.displayTitle
+            print("▶️ Starting playback with: \(firstVideo.displayTitle)")
+            
+            // Ensure we're at the start of the video
+            player.seek(to: .zero)
+            
+            // Force playback to start
+            DispatchQueue.main.async {
+                self.player.play()
+            }
         }
     }
     
@@ -524,903 +314,213 @@ class VideoPlayerModel: NSObject, ObservableObject {
         }
     }
     
-    // Add a helper function to check if a video is already downloaded
-    private func isVideoDownloaded(_ video: VideoItem) -> Bool {
-        return videos.contains { $0.title == video.title }
-    }
-    
-    // Add a function to get the local version of a video if it exists
-    private func getLocalVersion(_ video: VideoItem) -> VideoItem? {
-        return videos.first { $0.title == video.title }
-    }
-    
-    func downloadAndAddVideo(_ video: VideoItem, completion: @escaping (Bool) -> Void) {
-        print("\n=== 📥 Video Download Started ===")
-        print("Title: \(video.title)")
-        print("Remote URL: \(video.url)")
-        
-        let destinationURL = videosDirectory.appendingPathComponent(video.url.lastPathComponent)
-        print("\nDownload Details:")
-        print("Source: \(video.url)")
-        print("Destination: \(destinationURL.path)")
-        
-        // Check if already downloaded - EARLY EXIT
-        if let existingVideo = getLocalVersion(video) {
-            print("\n⚠️ Attempt to download already existing video")
-            print("Local URL: \(existingVideo.url)")
-            
-            let fileExists = FileManager.default.fileExists(atPath: existingVideo.url.path)
-            print("File exists: \(fileExists)")
-            
-            if fileExists {
-                print("❌ Error: Attempted to download an already downloaded video")
-                DispatchQueue.main.async {
-                    self.downloadProgress[video.id] = nil
-                    completion(true) // Return true since video is available
-                }
-                return
-            }
-            
-            // If we get here, the video is marked as downloaded but file is missing
-            print("⚠️ Video marked as downloaded but file is missing - removing from local videos")
-            videos.removeAll { $0.title == video.title }
-            
-            // Remove from UserDefaults
-            if var downloadedInfo = UserDefaults.standard.dictionary(forKey: downloadedVideosKey) as? [String: String] {
-                downloadedInfo.removeValue(forKey: video.title)
-                UserDefaults.standard.set(downloadedInfo, forKey: downloadedVideosKey)
-            }
-        }
-        
-        // Initialize progress
-        DispatchQueue.main.async {
-            self.downloadProgress[video.id] = 0.0
-        }
-        
-        print("\n🚀 Starting download...")
-        
-        // Create download request
-        let configuration = URLSessionConfiguration.default
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: configuration)
-        
-        // Create a signed URL request using the S3VideoService
-        let request = s3VideoService.s3Service.generateSignedRequest(for: video.url)
-        
-        let downloadTask = session.downloadTask(with: request) { [weak self] tempURL, response, error in
-            guard let self = self else { return }
-            
-            // Handle download completion
-            DispatchQueue.main.async {
-                if let error = error {
-                    print("\n❌ Download failed:")
-                    print("Error: \(error.localizedDescription)")
-                    self.downloadProgress[video.id] = nil
-                    completion(false)
-                    return
-                }
-                
-                guard let tempURL = tempURL,
-                      let httpResponse = response as? HTTPURLResponse else {
-                    print("\n❌ Invalid response type")
-                    self.downloadProgress[video.id] = nil
-                    completion(false)
-                    return
-                }
-                
-                // Log response details
-                print("\n📥 Download Response:")
-                print("Status Code: \(httpResponse.statusCode)")
-                if let contentLength = httpResponse.allHeaderFields["Content-Length"] as? String,
-                   let bytes = Double(contentLength) {
-                    let megabytes = bytes / 1_000_000.0
-                    print("Content Length: \(String(format: "%.1f MB", megabytes))")
-                }
-                
-                // Accept both 200 (OK) and 206 (Partial Content) as valid responses
-                guard httpResponse.statusCode == 200 || httpResponse.statusCode == 206 else {
-                    print("\n❌ Invalid response status: \(httpResponse.statusCode)")
-                    self.downloadProgress[video.id] = nil
-                    completion(false)
-                    return
-                }
-                
-                do {
-                    // Check if file already exists at destination
-                    if FileManager.default.fileExists(atPath: destinationURL.path) {
-                        print("\n⚠️ File already exists at destination - removing")
-                        try FileManager.default.removeItem(at: destinationURL)
-                    }
-                    
-                    try FileManager.default.moveItem(at: tempURL, to: destinationURL)
-                    
-                    // Add validation
-                    if !self.validateVideoFile(at: destinationURL) {
-                        print("❌ Downloaded file failed validation - removing")
-                        try? FileManager.default.removeItem(at: destinationURL)
-                        self.downloadProgress[video.id] = nil
-                        completion(false)
-                        return
-                    }
-                    
-                    // Get file info
-                    let attributes = try FileManager.default.attributesOfItem(atPath: destinationURL.path)
-                    let fileSize = attributes[.size] as? Int64 ?? 0
-                    
-                    if fileSize < 5_000_000 { // 5MB minimum
-                        print("❌ Downloaded file is suspiciously small (\(Double(fileSize) / 1_000_000.0) MB)")
-                        try? FileManager.default.removeItem(at: destinationURL)
-                        self.downloadProgress[video.id] = nil
-                        completion(false)
-                        return
-                    }
-                    
-                    print("\n✅ Download completed successfully:")
-                    print("Final location: \(destinationURL.path)")
-                    print("File size: \(Double(fileSize) / 1_000_000.0) MB")
-                    
-                    // Create local video with existing thumbnail
-                    let thumbnailInfo: VideoItem.ThumbnailInfo
-                    if let existingThumbnailURL = video.thumbnailInfo.url {
-                        thumbnailInfo = .local(existingThumbnailURL)
-                    } else if let s3URL = self.s3VideoService.getThumbnailURL(for: video.title) {
-                        thumbnailInfo = .remote(s3URL)
-                    } else {
-                        thumbnailInfo = .notAvailable
-                    }
-                    
-                    let localVideo = VideoItem(
-                        url: destinationURL,
-                        title: video.title,
-                        isLocal: true,
-                        thumbnailInfo: thumbnailInfo,
-                        section: video.section
-                    )
-                    
-                    // Double check we're not adding a duplicate
-                    if !self.videos.contains(where: { $0.title == video.title }) {
-                self.videos.append(localVideo)
-                    } else {
-                        print("⚠️ Prevented duplicate video addition")
-                    }
-                    
-                    // Update download tracking
-                    self.downloadProgress[video.id] = nil
-                    
-                    // Save to UserDefaults
-                    if var downloadedInfo = UserDefaults.standard.dictionary(forKey: self.downloadedVideosKey) as? [String: String] {
-                        downloadedInfo[video.title] = video.url.lastPathComponent
-                        UserDefaults.standard.set(downloadedInfo, forKey: self.downloadedVideosKey)
-                    } else {
-                        UserDefaults.standard.set([video.title: video.url.lastPathComponent], forKey: self.downloadedVideosKey)
-                    }
-                    
-                completion(true)
-                    
-                } catch {
-                    print("\n❌ Failed to save downloaded file:")
-                    print("Error: \(error.localizedDescription)")
-                    self.downloadProgress[video.id] = nil
-                    completion(false)
-                }
-            }
-        }
-        
-        // Set up progress observation
-        progressObservation?.invalidate()
-        progressObservation = downloadTask.progress.observe(
-            \.fractionCompleted,
-            options: [.new]
-        ) { [weak self] progress, _ in
-            DispatchQueue.main.async {
-                self?.downloadProgress[video.id] = progress.fractionCompleted
-                // Format the byte counts manually since .formatted() isn't available
-                let completedMB = Double(progress.completedUnitCount) / 1_000_000.0
-                let totalMB = Double(progress.totalUnitCount) / 1_000_000.0
-                print("\r📥 Download progress: \(Int(progress.fractionCompleted * 100))% (\(String(format: "%.1f", completedMB)) MB / \(String(format: "%.1f", totalMB)) MB)", terminator: "")
-            }
-        }
-        
-        downloadTask.resume()
-    }
-    
-    func updateSelectedVideos(_ selectedVideos: [VideoItem]) {
-        print("\n🎬 Updating Selected Videos:")
-        print("Total selected: \(selectedVideos.count)")
-        
-        // Filter to only local videos that exist
-        let validLocalVideos = selectedVideos.filter { video in
-            let exists = FileManager.default.fileExists(atPath: video.url.path)
-            print("- \(video.title)")
-            print("  Is Local: \(video.isLocal)")
-            print("  URL: \(video.url)")
-            print("  File exists: \(exists)")
-            return video.isLocal && exists
-        }
-        
-        // Save selection to UserDefaults
-        let selectedIds = selectedVideos.map { $0.id }
-        UserDefaults.standard.set(selectedIds, forKey: selectedVideoIdsKey)
-        print("Saved IDs to UserDefaults: \(selectedIds)")
-        
-        // Update playlist directly with filtered videos
-        updatePlaylist(validLocalVideos)
-    }
-    
     deinit {
-        // Remove all observers
+        // Remove timeObserver cleanup since we're not using it anymore
         NotificationCenter.default.removeObserver(self)
-        progressObservation?.invalidate()
         
-        // Remove KVO observers from player items
         player.items().forEach { item in
             item.removeObserver(self, forKeyPath: #keyPath(AVPlayerItem.status))
             item.removeObserver(self, forKeyPath: #keyPath(AVPlayerItem.isPlaybackLikelyToKeepUp))
         }
         
-        // Remove player observer
         player.removeObserver(self, forKeyPath: #keyPath(AVPlayer.timeControlStatus))
     }
     
-    // Add new helper function to check thumbnail cache
-    private func thumbnailCacheCheck(for videoTitle: String) -> URL? {
-        let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        // Sanitize the filename to handle special characters
-        let sanitizedTitle = videoTitle
-            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? videoTitle
-        let thumbnailURL = cacheDirectory.appendingPathComponent("\(sanitizedTitle)_thumbnail.jpg")
-        
-        let exists = FileManager.default.fileExists(atPath: thumbnailURL.path)
-        if exists {
-            // Verify the file is readable and not empty
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: thumbnailURL.path),
-               let size = attributes[.size] as? Int64,
-               size > 0 {
-                print("✅ Found valid thumbnail for: \(videoTitle)")
-                print("Path: \(thumbnailURL.path)")
-                print("Size: \(size) bytes")
-                return thumbnailURL
-            } else {
-                print("⚠️ Thumbnail file exists but may be corrupted: \(videoTitle)")
-                // Remove corrupted thumbnail
-                try? FileManager.default.removeItem(at: thumbnailURL)
-                return nil
-            }
-        }
-        return nil
-    }
-    
-    func debugThumbnails() {
-        print("\n=== 🔍 Thumbnail Debug Report ===")
-        for video in videos {
-            print("\nVideo: \(video.title)")
-            print("Thumbnail URL: \(video.thumbnailInfo.url?.absoluteString ?? "none")")
-            if let thumbURL = video.thumbnailInfo.url {
-                let exists = FileManager.default.fileExists(atPath: thumbURL.path)
-                print("Thumbnail exists: \(exists)")
-                if exists {
-                    if let attributes = try? FileManager.default.attributesOfItem(atPath: thumbURL.path),
-                       let size = attributes[.size] as? Int64 {
-                        print("Thumbnail size: \(size) bytes")
-                    }
-                }
-            }
-        }
-    }
-    
-    // Add this new function
-    func regenerateMissingThumbnails() {
-        print("\n=== 🔄 Regenerating Missing Thumbnails ===")
-        
-        // Create a queue for background processing
-        let queue = DispatchQueue(label: "thumbnail.regeneration", qos: .utility)
-        
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            // Get videos without thumbnails
-            let videosWithoutThumbnails = self.videos.filter { video in
-                if let thumbnailURL = video.thumbnailInfo.url {
-                    return !FileManager.default.fileExists(atPath: thumbnailURL.path)
-                }
-                return true
-            }
-            
-            print("Found \(videosWithoutThumbnails.count) videos missing thumbnails")
-            
-            for video in videosWithoutThumbnails {
-                print("\n🎥 Processing: \(video.title)")
-                
-                // Verify video file exists
-                guard FileManager.default.fileExists(atPath: video.url.path) else {
-                    print("❌ Video file not found at: \(video.url.path)")
-                    continue
-                }
-                
-                // Generate new thumbnail
-                print("🖼️ Generating thumbnail...")
-                if let thumbnailURL = self.generateThumbnail(for: video.url, title: video.title) {
-                    print("✅ Generated thumbnail at: \(thumbnailURL)")
-                    
-                    // Update the video item with the new thumbnail
-                    DispatchQueue.main.async {
-                        if let index = self.videos.firstIndex(where: { $0.id == video.id }) {
-                            let updatedVideo = VideoItem(
-                                url: video.url,
-                                title: video.title,
-                                isLocal: video.isLocal,
-                                thumbnailInfo: .remote(thumbnailURL),
-                                section: video.section
-                            )
-                            self.videos[index] = updatedVideo
-                            print("✅ Updated video item with new thumbnail")
-                        }
-                    }
-                } else {
-                    print("❌ Failed to generate thumbnail")
-                }
-            }
-            
-            // Final report
-            DispatchQueue.main.async {
-                print("\n=== 📊 Thumbnail Regeneration Complete ===")
-                self.debugThumbnails()
-            }
-        }
-    }
-    
-    // Add this function to check download status
-    func debugDownloadStatus(_ remoteVideos: [VideoItem]) {
-        print("\n=== 📊 Download Status Report ===")
-        
-        // Create lookup set of local video titles
-        let localVideoTitles = Set(videos.map { $0.title })
-        
-        // Group by section
-        let groupedVideos = Dictionary(grouping: remoteVideos) { $0.section }
-        
-        for (section, sectionVideos) in groupedVideos.sorted(by: { $0.key < $1.key }) {
-            print("\n📁 Section: \(section)")
-            
-            for video in sectionVideos {
-                let isDownloaded = localVideoTitles.contains(video.title)
-                print("\n🎥 \(video.displayTitle)")
-                print("Status: \(isDownloaded ? "✅ Downloaded" : "🔄 Not Downloaded")")
-                if isDownloaded {
-                    if let localVideo = videos.first(where: { $0.title == video.title }) {
-                        print("Local URL: \(localVideo.url)")
-                        print("File exists: \(FileManager.default.fileExists(atPath: localVideo.url.path))")
-                        print("Thumbnail: \(localVideo.thumbnailInfo.url?.absoluteString ?? "none")")
-                    }
-                }
-                print("Remote URL: \(video.url)")
-            }
-        }
-        
-        print("\n📚 Total Statistics:")
-        print("Remote videos: \(remoteVideos.count)")
-        print("Downloaded videos: \(videos.count)")
-        print("Sections: \(Set(remoteVideos.map { $0.section }).sorted().joined(separator: ", "))")
-    }
-    
-    func clearCache() {
-        print("\n🧹 Clearing downloaded video cache...")
-        
-        let bundledVideoIds = Set(bundledVideos.map { "local-\($0.title)" })
-        
-        // Clear downloaded videos from UserDefaults
-        UserDefaults.standard.removeObject(forKey: downloadedVideosKey)
-        
-        // Update selected videos to keep only bundled ones
-        if let selectedIds = UserDefaults.standard.array(forKey: selectedVideoIdsKey) as? [String] {
-            let remainingSelectedIds = selectedIds.filter { bundledVideoIds.contains($0) }
-            UserDefaults.standard.set(remainingSelectedIds, forKey: selectedVideoIdsKey)
-        }
-        
-        // Clear downloaded videos directory
-        do {
-            let fileManager = FileManager.default
-            let files = try fileManager.contentsOfDirectory(at: videosDirectory, includingPropertiesForKeys: nil)
-            try files.forEach { file in
-                try fileManager.removeItem(at: file)
-            }
-            print("✅ Cleared downloaded videos directory")
-        } catch {
-            print("❌ Error clearing videos directory: \(error)")
-        }
-        
-        // Clear ALL thumbnail cache (including for remote videos)
-        do {
-            let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            let thumbnailFiles = try FileManager.default.contentsOfDirectory(
-                at: cacheDirectory,
-                includingPropertiesForKeys: nil
-            ).filter { $0.lastPathComponent.contains("_thumbnail") }
-            
-            print("\n🖼 Clearing \(thumbnailFiles.count) cached thumbnails...")
-            for thumbnailURL in thumbnailFiles {
-                try FileManager.default.removeItem(at: thumbnailURL)
-                print("Removed: \(thumbnailURL.lastPathComponent)")
-            }
-            print("✅ Cleared all thumbnails")
-        } catch {
-            print("❌ Error clearing thumbnails: \(error)")
-        }
-        
-        // Remove downloaded videos from videos array but keep bundled ones
-        videos = videos.filter { video in
-            let isBundled = bundledVideos.contains { $0.title == video.title }
-            print("\(video.title): \(isBundled ? "Keeping (bundled)" : "Removing (downloaded)")")
-            return isBundled
-        }
-        
-        // Update current playlist to only include bundled videos
-        selectedPlaylist = selectedPlaylist.filter { video in
-            bundledVideos.contains { $0.title == video.title }
-        }
-        
-        // Stop playback if no bundled videos are in the playlist
-        if selectedPlaylist.isEmpty {
-            player.removeAllItems()
-            currentVideoTitle = ""
-        }
-        
-        // Clear metadata cache
-        cacheManager.clearMetadata()
-        
-        // Force refresh of remote videos and thumbnails
-        s3VideoService.fetchAvailableVideos { [weak self] result in
-            guard let self = self else { return }
-            
-            switch result {
-            case .success(let videos):
-                DispatchQueue.main.async {
-                    self.remoteVideos = videos
-                    print("✅ Refreshed remote videos after cache clear")
-                    print("Found \(videos.count) remote videos")
-                    
-                    // Force refresh of all thumbnails
-                    self.s3VideoService.refreshThumbnails(forceRefresh: true)
-                }
-            case .failure(let error):
-                print("❌ Failed to refresh remote videos after cache clear: \(error.localizedDescription)")
-            }
-        }
-        
-        print("\n✅ Cache cleared successfully")
-        print("Kept \(videos.count) bundled videos")
-        print("Current playlist: \(selectedPlaylist.map { $0.title }.joined(separator: ", "))")
-    }
-    
-    // Add this function to VideoPlayerModel
-    func debugVideoDownload(_ video: VideoItem) {
-        print("\n=== 📱 Video Download Debug ===")
-        print("Title: \(video.title)")
-        print("ID: \(video.id)")
-        print("Is Local: \(video.isLocal)")
-        print("URL: \(video.url)")
-        
-        // Check if video is in local videos array
-        let isInLocalArray = videos.contains { $0.title == video.title }
-        print("\n📚 Local Videos Status:")
-        print("In local videos array: \(isInLocalArray)")
-        
-        // Check UserDefaults
-        if let downloadedInfo = UserDefaults.standard.dictionary(forKey: downloadedVideosKey) as? [String: String] {
-            let isInUserDefaults = downloadedInfo[video.title] != nil
-            print("\n💾 UserDefaults Status:")
-            print("In downloaded videos: \(isInUserDefaults)")
-            if isInUserDefaults {
-                print("Saved filename: \(downloadedInfo[video.title] ?? "none")")
-            }
-        }
-        
-        // Check file system
-        let expectedPath = videosDirectory.appendingPathComponent(video.url.lastPathComponent)
-        let fileExists = FileManager.default.fileExists(atPath: expectedPath.path)
-        print("\n📁 File System Status:")
-        print("Expected path: \(expectedPath.path)")
-        print("File exists: \(fileExists)")
-        
-        if fileExists {
-            do {
-                let attributes = try FileManager.default.attributesOfItem(atPath: expectedPath.path)
-                let fileSize = attributes[.size] as? Int64 ?? 0
-                let modificationDate = attributes[.modificationDate] as? Date
-                print("File size: \(Double(fileSize) / 1_000_000.0) MB")
-                print("Last modified: \(modificationDate?.description ?? "unknown")")
-            } catch {
-                print("Error getting file attributes: \(error.localizedDescription)")
-            }
-        }
-        
-        // Check if video is selected
-        if let selectedIds = UserDefaults.standard.array(forKey: selectedVideoIdsKey) as? [String] {
-            let isSelected = selectedIds.contains(video.id)
-            print("\n✅ Selection Status:")
-            print("Is selected: \(isSelected)")
-        }
-    }
-    
-    // Add this function to VideoPlayerModel
-    private func checkCacheStatus() {
-        print("\n=== 📦 Cache Status Check ===")
-        
-        // Check videos directory
-        do {
-            let files = try FileManager.default.contentsOfDirectory(at: videosDirectory, includingPropertiesForKeys: nil)
-            print("\n📁 Videos Directory Status:")
-            print("Path: \(videosDirectory.path)")
-            print("Found \(files.count) files:")
-            
-            var totalSize: Int64 = 0
-            for file in files {
-                if let attributes = try? FileManager.default.attributesOfItem(atPath: file.path) {
-                    let size = attributes[.size] as? Int64 ?? 0
-                    totalSize += size
-                    print("- \(file.lastPathComponent)")
-                    print("  Size: \(Double(size) / 1_000_000.0) MB")
-                }
-            }
-            print("Total cache size: \(Double(totalSize) / 1_000_000.0) MB")
-        } catch {
-            print("❌ Error reading videos directory: \(error.localizedDescription)")
-        }
-        
-        // Check thumbnails
-        let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        do {
-            let thumbnails = try FileManager.default.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: nil)
-                .filter { $0.lastPathComponent.contains("_thumbnail") }
-            
-            print("\n🖼 Thumbnail Cache Status:")
-            print("Found \(thumbnails.count) thumbnails:")
-            for thumbnail in thumbnails {
-                if let attributes = try? FileManager.default.attributesOfItem(atPath: thumbnail.path) {
-                    let size = attributes[.size] as? Int64 ?? 0
-                    print("- \(thumbnail.lastPathComponent)")
-                    print("  Size: \(Double(size) / 1_000.0) KB")
-                }
-            }
-        } catch {
-            print("❌ Error reading thumbnail cache: \(error.localizedDescription)")
-        }
-        
-        // Check UserDefaults status
-        print("\n💾 UserDefaults Status:")
-        if let downloadedInfo = UserDefaults.standard.dictionary(forKey: downloadedVideosKey) as? [String: String] {
-            print("Found \(downloadedInfo.count) registered downloads:")
-            for (title, filename) in downloadedInfo {
-                let videoPath = videosDirectory.appendingPathComponent(filename)
-                let exists = FileManager.default.fileExists(atPath: videoPath.path)
-                print("- \(title)")
-                print("  Filename: \(filename)")
-                print("  File exists: \(exists)")
-            }
-        } else {
-            print("No downloaded videos registered")
-        }
-        
-        // Compare with remote videos
-        print("\n🌐 Remote Video Cache Status:")
-        for video in remoteVideos {
-            let localPath = videosDirectory.appendingPathComponent(video.url.lastPathComponent)
-            let exists = FileManager.default.fileExists(atPath: localPath.path)
-            let hasThumbnail = thumbnailCacheCheck(for: video.title) != nil
-            
-            print("\n- \(video.title)")
-            print("  Cached: \(exists)")
-            print("  Has thumbnail: \(hasThumbnail)")
-            
-            if exists {
-                if let attributes = try? FileManager.default.attributesOfItem(atPath: localPath.path) {
-                    let size = attributes[.size] as? Int64 ?? 0
-                    let modified = attributes[.modificationDate] as? Date
-                    print("  Size: \(Double(size) / 1_000_000.0) MB")
-                    print("  Last modified: \(modified?.description ?? "unknown")")
-                }
-            }
-        }
-    }
-    
-    // Add this function
-    private func validateVideoFile(at url: URL) -> Bool {
-        let asset = AVURLAsset(url: url)
-        let keys = ["duration", "tracks"]
-        
-        // Load synchronously
-        asset.loadValuesAsynchronously(forKeys: keys) {}
-        
-        // Wait briefly for loading
-        let timeout = Date().addingTimeInterval(2.0)
-        while Date() < timeout {
-            let durationStatus = asset.statusOfValue(forKey: "duration", error: nil)
-            let tracksStatus = asset.statusOfValue(forKey: "tracks", error: nil)
-            
-            if durationStatus != .loading && tracksStatus != .loading {
-                print("Video validation results:")
-                print("Duration status: \(durationStatus.rawValue)")
-                print("Tracks status: \(tracksStatus.rawValue)")
-                print("Duration: \(asset.duration.seconds) seconds")
-                print("Track count: \(asset.tracks.count)")
-                
-                return durationStatus == .loaded && tracksStatus == .loaded &&
-                       asset.duration.seconds > 0 && !asset.tracks.isEmpty
-            }
-            
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        
-        return false
-    }
-    
-    var allVideos: [VideoItem] {
+    var allVideos: [Video] {
         // Get the list of downloaded video titles
-        let downloadedTitles = Set(videos.map { $0.title })
+        let downloadedTitles = Set(videos.map { $0.displayTitle })
         
         // Start with all local videos
         var orderedVideos = videos
         
         // Add only remote videos that aren't already downloaded
-        let nonDownloadedRemoteVideos = remoteVideos.filter { !downloadedTitles.contains($0.title) }
+        let nonDownloadedRemoteVideos = remoteVideos.filter { !downloadedTitles.contains($0.displayTitle) }
         orderedVideos.append(contentsOf: nonDownloadedRemoteVideos)
-        
-        print("\n📊 Video List Status:")
-        print("Local videos: \(videos.count)")
-        print("Remote videos (not downloaded): \(nonDownloadedRemoteVideos.count)")
-        print("Total unique videos: \(orderedVideos.count)")
         
         return orderedVideos
     }
     
-    // Add this helper method to update thumbnail URLs
-    private func updateRemoteVideoThumbnails(with thumbnails: [String: URL]) {
-        print("\n🔄 Updating remote video thumbnails")
-        print("Received \(thumbnails.count) thumbnail updates")
+    func downloadAndAddVideo(_ video: Video, completion: @escaping (Bool) -> Void) {
+        print("\n📥 Starting download for: \(video.displayTitle)")
         
-        remoteVideos = remoteVideos.map { video -> VideoItem in
-            if let newThumbnailURL = thumbnails[video.title] ?? thumbnailCacheCheck(for: video.title) {
-                print("✅ Updated thumbnail for: \(video.title)")
-                return VideoItem(
-                    url: video.url,
-                    title: video.title,
-                    isLocal: video.isLocal,
-                    thumbnailInfo: .remote(newThumbnailURL),
-                    section: video.section
-                )
-            }
-            return video
+        guard let remotePath = video.remoteVideoPath else {
+            print("❌ No remote video path available")
+            completion(false)
+            return
         }
-    }
-    
-    func debugThumbnailLifecycle(_ video: VideoItem) {
-        print("\n=== 🖼 Thumbnail Lifecycle Debug for: \(video.title) ===")
         
-        // 1. Check assigned thumbnail URL
-        print("\n📌 Thumbnail URL Status:")
-        if let thumbnailURL = video.thumbnailInfo.url {
-            print("Assigned URL: \(thumbnailURL)")
+        let request = s3VideoService.generateSignedRequest(for: video)
+        
+        let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
+            guard let self = self else { return }
             
-            // Check if it's a local cache URL or remote S3 URL
-            if thumbnailURL.absoluteString.contains("file://") {
-                print("Type: Local Cache URL")
-            } else if thumbnailURL.absoluteString.contains("s3") {
-                print("Type: Remote S3 URL")
+            if let error = error {
+                print("❌ Download failed: \(error.localizedDescription)")
+                completion(false)
+                return
             }
-        } else {
-            print("❌ No thumbnail URL assigned")
-        }
-        
-        // 2. Check local cache
-        print("\n💾 Cache Status:")
-        if let cachedURL = thumbnailCacheCheck(for: video.title) {
-            print("✅ Found in cache: \(cachedURL)")
             
-            // Verify cached file
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: cachedURL.path) {
-                let size = attributes[.size] as? Int64 ?? 0
-                print("File size: \(size) bytes")
-                
-                // Try to load the image data to verify it's valid
-                if let data = try? Data(contentsOf: cachedURL) {
-                    print("✅ Cache file is readable (\(data.count) bytes)")
-                } else {
-                    print("❌ Cache file exists but is not readable")
-                }
+            guard let tempURL = tempURL,
+                  let response = response as? HTTPURLResponse,
+                  (200...299).contains(response.statusCode) else {
+                print("❌ Invalid response or missing file")
+                completion(false)
+                return
             }
-        } else {
-            print("❌ Not found in cache")
-        }
-        
-        // 3. Check S3 availability
-        print("\n☁️ S3 Status:")
-        if let s3URL = s3VideoService.getThumbnailURL(for: video.title) {
-            print("S3 URL available: \(s3URL)")
-        } else {
-            print("❌ Could not generate S3 URL")
-        }
-        
-        // 4. Compare assigned vs available URLs
-        print("\n🔄 URL Comparison:")
-        let cachedURL = thumbnailCacheCheck(for: video.title)
-        let s3URL = s3VideoService.getThumbnailURL(for: video.title)
-        print("Assigned: \(video.thumbnailInfo.url?.absoluteString ?? "none")")
-        print("Cached  : \(cachedURL?.absoluteString ?? "none")")
-        print("S3      : \(s3URL?.absoluteString ?? "none")")
-    }
-    
-    // Add these helper functions
-    private enum ThumbnailStatus {
-        case valid(URL)
-        case corrupted
-        case missing
-    }
-    
-    private func validateThumbnail(for videoTitle: String) -> ThumbnailStatus {
-        print("Validating thumbnail for: \(videoTitle)")
-        
-        if let cachedURL = thumbnailCacheCheck(for: videoTitle) {
-            // Try to load the image data to verify it's valid
+            
             do {
-                let data = try Data(contentsOf: cachedURL)
-                if data.count > 0 {
-                    print("✅ Thumbnail validated: \(data.count) bytes")
-                    return .valid(cachedURL)
-                } else {
-                    print("❌ Thumbnail file is empty")
-                    return .corrupted
+                let finalURL = self.videosDirectory.appendingPathComponent(remotePath)
+                try? FileManager.default.removeItem(at: finalURL)
+                try FileManager.default.moveItem(at: tempURL, to: finalURL)
+                
+                // Update VideoManager
+                let relativePath = "Videos/\(remotePath)"
+                self.videoManager.updateLocalPath(for: video.id, path: relativePath)
+                
+                // Reload videos to update UI
+                DispatchQueue.main.async {
+                    self.loadVideos()
+                    self.downloadProgress.removeValue(forKey: video.id)
+                    completion(true)
                 }
+                
             } catch {
-                print("❌ Thumbnail file is corrupted: \(error.localizedDescription)")
-                return .corrupted
+                print("❌ Failed to save video: \(error.localizedDescription)")
+                completion(false)
             }
         }
         
-        print("❌ No thumbnail found in cache")
-        return .missing
+        task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] (progress: Progress, _: NSKeyValueObservedChange<Double>) in
+            DispatchQueue.main.async {
+                self?.downloadProgress[video.id] = progress.fractionCompleted
+            }
+        }
+        
+        task.resume()
     }
     
-    private func processFreshVideos(_ freshVideos: [VideoItem], existingCache: Set<String>) {
-        print("\n=== 📥 Processing Fresh Videos ===")
+    private func ensureThumbnail(for video: Video) -> URL? {
+        print("\n🖼️ Ensuring thumbnail for: \(video.displayTitle)")
         
-        // Get current downloaded titles
-        let downloadedTitles = Set(videos.map { $0.title })
-        
-        // Find new videos not in cache
-        let newVideos = freshVideos.filter { !existingCache.contains($0.title) }
-        print("Found \(newVideos.count) new videos not in cache")
-        
-        // Update metadata cache with fresh data
-        let freshMetadata = freshVideos.map { video in
-            VideoCacheManager.VideoMetadata(
-                title: video.title,
-                remoteURL: video.url,
-                section: video.section,
-                hasCachedThumbnail: thumbnailCacheCheck(for: video.title) != nil,
-                isDownloaded: downloadedTitles.contains(video.title),
-                lastUpdated: Date()
-            )
+        // 1. Check for existing local thumbnail
+        if let localPath = video.localThumbnailPath {
+            let thumbnailURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent(localPath)
+            if FileManager.default.fileExists(atPath: thumbnailURL.path) {
+                print("✅ Using existing local thumbnail: \(thumbnailURL.path)")
+                return thumbnailURL
+            }
         }
-        cacheManager.saveVideoMetadata(freshMetadata)
         
-        // Update remote videos list, excluding downloaded ones
-        let updatedRemoteVideos = freshVideos.filter { !downloadedTitles.contains($0.title) }
-            .map { video -> VideoItem in
-                // Use cached thumbnail if available, otherwise use S3 URL
-                if let thumbnailURL = thumbnailCacheCheck(for: video.title) ?? 
-                                     s3VideoService.getThumbnailURL(for: video.title) {
-                    return VideoItem(
-                        url: video.url,
-                        title: video.title,
-                        isLocal: false,
-                        thumbnailInfo: .remote(thumbnailURL),
-                        section: video.section
-                    )
-                } else {
-                    // If no thumbnail URL is available, use .notAvailable
-                    return VideoItem(
-                        url: video.url,
-                        title: video.title,
-                        isLocal: false,
-                        thumbnailInfo: .notAvailable,
-                        section: video.section
-                    )
+        // 2. If we have a local video, generate thumbnail
+        if video.isLocal {
+            print("📹 Generating thumbnail from local video: \(video.url.path)")
+            if let thumbnailURL = generateThumbnail(from: video.url, videoId: video.id) {
+                let relativePath = "Thumbnails/\(video.id)_thumbnail.jpg"
+                videoManager.updateThumbnailPath(for: video.id, path: relativePath)
+                print("✅ Generated and saved local thumbnail: \(thumbnailURL.path)")
+                return thumbnailURL
+            }
+        }
+        
+        // 3. Download remote thumbnail if available
+        if let remoteThumbnailURL = video.remoteThumbnailURL {
+            print("☁️ Downloading remote thumbnail: \(remoteThumbnailURL)")
+            downloadThumbnail(from: remoteThumbnailURL) { [weak self] thumbnailURL in
+                if let thumbnailURL = thumbnailURL {
+                    let relativePath = "Thumbnails/\(video.id)_thumbnail.jpg"
+                    self?.videoManager.updateThumbnailPath(for: video.id, path: relativePath)
+                    print("✅ Downloaded and saved remote thumbnail: \(thumbnailURL.path)")
                 }
             }
-        
-        remoteVideos = updatedRemoteVideos
-        isInitialLoad = false
-        
-        print("✅ Updated UI with \(updatedRemoteVideos.count) remote videos")
-        
-        // Download thumbnails for new videos
-        if !newVideos.isEmpty {
-            print("\n🔄 Downloading thumbnails for \(newVideos.count) new videos")
-            s3VideoService.refreshThumbnails(forTitles: newVideos.map { $0.title })
         }
+        
+        return nil
     }
     
-    func debugThumbnailURLs() {
-        print("\n=== 🔍 Debugging Thumbnail URLs ===")
+    private func generateThumbnail(from videoURL: URL, videoId: String) -> URL? {
+        let asset = AVAsset(url: videoURL)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
         
-        // Check remote videos
-        print("\nRemote Videos:")
-        for video in remoteVideos {
-            print("\n🎥 Video: \(video.title)")
-            switch video.thumbnailInfo {
-            case .local(let url):
-                print("Type: Local")
-                print("URL: \(url)")
-                print("Exists: \(FileManager.default.fileExists(atPath: url.path))")
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
-                    print("Size: \(attrs[.size] as? Int64 ?? 0) bytes")
-                }
-            case .remote(let url):
-                print("Type: Remote")
-                print("URL: \(url)")
-            case .notAvailable:
-                print("Type: Not Available")
+        let thumbnailURL = thumbnailsDirectory.appendingPathComponent("\(videoId)_thumbnail.jpg")
+        
+        do {
+            let cgImage = try imageGenerator.copyCGImage(at: .zero, actualTime: nil)
+            let uiImage = UIImage(cgImage: cgImage)
+            if let jpegData = uiImage.jpegData(compressionQuality: 0.8) {
+                try jpegData.write(to: thumbnailURL)
+                return thumbnailURL
+            }
+        } catch {
+            print("❌ Failed to generate thumbnail: \(error)")
+        }
+        
+        return nil
+    }
+    
+    private func downloadThumbnail(from url: URL, completion: @escaping (URL?) -> Void) {
+        let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
+            guard let self = self,
+                  let tempURL = tempURL,
+                  error == nil else {
+                print("❌ Failed to download thumbnail: \(error?.localizedDescription ?? "Unknown error")")
+                completion(nil)
+                return
+            }
+            
+            let thumbnailURL = self.thumbnailsDirectory.appendingPathComponent("\(UUID().uuidString)_thumbnail.jpg")
+            
+            do {
+                try FileManager.default.moveItem(at: tempURL, to: thumbnailURL)
+                completion(thumbnailURL)
+            } catch {
+                print("❌ Failed to save thumbnail: \(error)")
+                completion(nil)
+            }
+        }
+        task.resume()
+    }
+    
+    // Add this public method to VideoPlayerModel
+    func toggleVideoSelection(for videoId: String) {
+        // Get current selection state
+        let currentState = videoManager.videos.first(where: { $0.id == videoId })?.isSelected ?? false
+        
+        // Prevent deselecting the last local video
+        if currentState {
+            let selectedLocalVideos = videos.filter { $0.isLocal && $0.isSelected }
+            if selectedLocalVideos.count <= 1 {
+                return
             }
         }
         
-        // Check local videos
-        print("\nLocal Videos:")
-        for video in videos {
-            print("\n🎥 Video: \(video.title)")
-            switch video.thumbnailInfo {
-            case .local(let url):
-                print("Type: Local")
-                print("URL: \(url)")
-                print("Exists: \(FileManager.default.fileExists(atPath: url.path))")
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
-                    print("Size: \(attrs[.size] as? Int64 ?? 0) bytes")
-                }
-            case .remote(let url):
-                print("Type: Remote")
-                print("URL: \(url)")
-            case .notAvailable:
-                print("Type: Not Available")
-            }
-        }
+        // Update selection state in VideoManager
+        videoManager.updateSelection(for: videoId, isSelected: !currentState)
         
-        // Check cache directory
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        print("\nCache Directory Contents:")
-        if let files = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
-            for file in files.filter({ $0.lastPathComponent.contains("_thumbnail") }) {
-                print("\nFile: \(file.lastPathComponent)")
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path) {
-                    print("Size: \(attrs[.size] as? Int64 ?? 0) bytes")
-                }
-            }
-        }
+        // Update local videos array
+        videos = videoManager.videos
+        
+        // Update player playlist
+        updateSelectedVideos(videos)
+        
+        // Debug logging
+        print("\n🎬 Video selection changed:")
+        print("Video: \(videoId)")
+        print("New state: \(!currentState)")
+        print("Currently selected: \(selectedVideos.map(\.displayTitle).joined(separator: ", "))")
+    }
+    
+    // Add a method to get the current video from a player item
+    private func getVideo(from playerItem: AVPlayerItem) -> Video? {
+        guard let asset = playerItem.asset as? AVURLAsset else { return nil }
+        return currentPlaylist.first { $0.url == asset.url }
     }
 }
 
-// Helper extension to safely access array elements
+// Helper extension for safe array access
 extension Array {
-    func safe(_ index: Int) -> Element? {
-        indices.contains(index) ? self[index] : nil
-    }
-}
-
-// Replace the async AVAsset extension with this synchronous version
-extension AVAsset {
-    func load(_ propertyName: String) throws -> Bool {
-        var error: NSError?
-        let status = statusOfValue(forKey: propertyName, error: &error)
-        
-        switch status {
-        case .loaded:
-            return true
-        case .failed:
-            throw error ?? NSError(domain: "AVAsset", code: 0, userInfo: [NSLocalizedDescriptionKey: "Failed to load \(propertyName)"])
-        case .cancelled:
-            throw NSError(domain: "AVAsset", code: 0, userInfo: [NSLocalizedDescriptionKey: "Cancelled loading \(propertyName)"])
-        default:
-            // Load the value synchronously
-            loadValuesAsynchronously(forKeys: [propertyName]) {}
-            return statusOfValue(forKey: propertyName, error: nil) == .loaded
-        }
+    subscript(safe index: Int) -> Element? {
+        return indices.contains(index) ? self[index] : nil
     }
 } 

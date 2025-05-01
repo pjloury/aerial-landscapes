@@ -44,7 +44,7 @@ struct NowPlayingView: View {
                 .edgesIgnoringSafeArea(.all)
             
             // Show message when no videos are selected
-            if videoPlayerModel.selectedPlaylist.isEmpty {
+            if videoPlayerModel.selectedVideos.isEmpty {
                 Text("Head to More Videos to get started")
                     .font(.system(size: 30, weight: .medium))
                     .foregroundColor(.white)
@@ -52,7 +52,7 @@ struct NowPlayingView: View {
             }
             
             // Title overlay (only show when video is playing)
-            if !videoPlayerModel.selectedPlaylist.isEmpty {
+            if !videoPlayerModel.selectedVideos.isEmpty {
                 VStack {
                     Spacer()
                     HStack {
@@ -78,13 +78,22 @@ struct VideoPlayerView: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
         controller.player = player
-        controller.showsPlaybackControls = false // Hide transport controls
+        controller.showsPlaybackControls = false
         controller.videoGravity = .resizeAspectFill
+        
+        // Debug the controller setup
+        print("\n🎮 Player Controller Setup:")
+        print("Player attached: \(controller.player != nil)")
+        print("Current item: \(String(describing: controller.player?.currentItem?.asset))")
+        
         return controller
     }
     
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
-        // Update if needed
+        // Debug updates
+        print("\n🔄 Player Controller Update:")
+        print("Player status: \(uiViewController.player?.status.rawValue ?? -1)")
+        print("Current item duration: \(uiViewController.player?.currentItem?.duration.seconds ?? 0)")
     }
 }
 
